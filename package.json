@@ -1,0 +1,40 @@
+{
+	"name": "mail-client",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"scripts": {
+		"dev": "bun --bun vite --host localhost",
+		"build": "bun --bun vite build",
+		"start": "bun build/index.js",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"test": "bun test",
+		"format": "prettier --write src tests"
+	},
+	"dependencies": {
+		"@simplewebauthn/browser": "^13.2.2",
+		"@simplewebauthn/server": "^13.2.2",
+		"imapflow": "^1.0.195",
+		"jose": "^6.1.0",
+		"mailparser": "^3.7.4",
+		"nodemailer": "^10.0.10"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-node": "^5.2.12",
+		"@sveltejs/kit": "^2.37.0",
+		"@sveltejs/vite-plugin-svelte": "^6.2.0",
+		"@types/bun": "latest",
+		"@types/mailparser": "^3.4.6",
+		"@types/nodemailer": "^8.0.1",
+		"prettier": "^3.9.6",
+		"prettier-plugin-svelte": "^4.1.1",
+		"svelte": "^5.38.0",
+		"svelte-check": "^4.3.1",
+		"typescript": "^5.9.2",
+		"vite": "^7.1.0"
+	},
+	"overrides": {
+		"cookie": "^0.7.2",
+		"nodemailer": "^10.0.10"
+	}
+}
