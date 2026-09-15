@@ -91,9 +91,9 @@
 					</div>
 					<span class="subject">{message.subject}</span>
 					<p>{message.text.replaceAll('\n', ' ')}</p>
-					<div class="row-bottom">
-						{#if message.attachments.length}<Icon name="clip" size={13} />{/if}
-					</div></button
+					{#if message.attachments.length}<div class="row-bottom">
+						<Icon name="clip" size={13} />
+					</div>{/if}</button
 				>{/each}{/if}{#if !(folder === 'drafts' ? drafts.length : messages.length)}<div
 				class="list-empty"
 			>

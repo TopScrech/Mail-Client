@@ -170,13 +170,14 @@ kbd {
 	min-height: 0;
 }
 .sidebar {
+	--sidebar-inset: 14px;
 	width: 226px;
 	flex-shrink: 0;
 	background: var(--sidebar);
 	border-right: 1px solid var(--line);
 	display: flex;
 	flex-direction: column;
-	padding: 0 14px;
+	padding: 0 var(--sidebar-inset);
 }
 .sidebar-brand {
 	height: 77px;
@@ -228,7 +229,7 @@ kbd {
 	font-size: 13px;
 	gap: 13px;
 }
-.sidebar nav button > span:first-of-type {
+.sidebar nav button > .folder-label {
 	flex: 1;
 	text-align: left;
 }
@@ -311,6 +312,7 @@ kbd {
 	background: var(--red);
 }
 .sidebar-bottom {
+	margin-inline: calc(-1 * var(--sidebar-inset));
 	margin-top: auto;
 	padding-top: 24px;
 }
@@ -442,8 +444,7 @@ kbd {
 	position: relative;
 	text-align: left;
 	border-bottom: 1px solid #303448;
-	padding: 19px 23px 10px;
-	min-height: 114px;
+	padding: 13px 23px;
 	color: #a5adc2;
 }
 .message-row.selected {
@@ -457,7 +458,7 @@ kbd {
 	display: flex;
 	align-items: center;
 	gap: 7px;
-	margin-bottom: 8px;
+	margin-bottom: 6px;
 }
 .row-top strong {
 	font-size: 12px;
@@ -1220,14 +1221,11 @@ label > small {
 	.message-content {
 		padding-top: 48px;
 	}
-	.message-row {
-		min-height: 122px;
-	}
 }
 @media (max-width: 1100px) {
 	.sidebar {
+		--sidebar-inset: 10px;
 		width: 200px;
-		padding: 0 10px;
 	}
 	.message-list {
 		width: 315px;
@@ -1281,9 +1279,6 @@ label > small {
 	}
 	.reader-toolbar > .reader-actions:last-child {
 		margin-left: auto;
-	}
-	.message-row {
-		min-height: 115px;
 	}
 	.sender-line time {
 		margin-left: 0;
@@ -1455,4 +1450,17 @@ label > small {
 	.spinning .sf-symbol-icon {
 		animation: none;
 	}
+}
+
+@font-face {
+	font-family: 'Mail Otter Symbols Light';
+	src: local('SFPro-Light'), local('SFProDisplay-Light');
+	font-weight: 300;
+}
+.sidebar-brand .sf-symbol-icon {
+	font-family: 'Mail Otter Symbols Light', 'Mail Otter Symbols';
+	font-weight: 300;
+}
+.sidebar-brand .vector-icon {
+	stroke-width: 1.3;
 }

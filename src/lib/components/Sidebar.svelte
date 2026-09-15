@@ -40,7 +40,7 @@
 
 <aside class="sidebar">
 	<div class="sidebar-brand">
-		<span class="app-icon"><Icon name="mail" size={19} /></span><strong>Mail Otter</strong>
+		<span class="app-icon"><Icon name="mail" size={17} /></span><strong>Mail Otter</strong>
 	</div>
 	<button class="compose-button" onclick={oncompose}
 		><Icon name="compose" size={18} /> New message <kbd>N</kbd></button
@@ -50,7 +50,7 @@
 		{#each folders as item}<button
 				class:active={folder === item.id}
 				onclick={() => onfolder(item.id)}
-				><Icon name={item.icon} size={19} /><span>{item.label}</span
+				><Icon name={item.icon} size={19} /><span class="folder-label">{item.label}</span
 				>{#if item.id === 'inbox' && unread}<span class="count">{unread}</span
 					>{:else if item.id === 'drafts' && state.drafts.length}<span class="count"
 						>{state.drafts.length}</span
