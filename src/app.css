@@ -1464,3 +1464,26 @@ label > small {
 .sidebar-brand .vector-icon {
 	stroke-width: 1.3;
 }
+
+.settings-heading,
+.account-label-form {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.passkey-help {
+	border: 1px solid var(--line);
+	border-radius: 50%;
+	width: 20px;
+	height: 20px;
+	padding: 0;
+	color: var(--muted);
+}
+.account-label-form {
+	margin-block: 10px;
+	flex-wrap: wrap;
+}
+.account-label-form label {
+	flex: 1;
+	min-width: 140px;
+}

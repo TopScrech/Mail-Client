@@ -5,7 +5,7 @@ process.env.ENCRYPTION_KEY = Buffer.alloc(32, 9).toString('base64');
 process.env.ORIGIN = 'http://localhost:5173';
 const { db, one, challenge, consume, limit, snapshot } = await import('../src/lib/server/db');
 const { encrypt, decrypt, hash } = await import('../src/lib/server/crypto');
-const { GET, POST, PUT, DELETE } = await import('../src/routes/api/v1/[...path]/+server');
+const { GET, POST, PUT, PATCH, DELETE } = await import('../src/routes/api/v1/[...path]/+server');
 const origin = 'http://localhost:5173';
 const tokens = { alice: 'alice-session-secret', bob: 'bob-session-secret' };
 function event(
@@ -255,5 +255,28 @@ describe('Delivery idempotency', () => {
 			Date.now() + 60000
 		);
 		await expect(send('alice', draft, [], 'uncertain-send')).rejects.toThrow('uncertain');
+	});
+});
+
+describe('Account labels', () => {
+	test('renames sync and preserve other account fields', async () => {
+		const before = snapshot('alice');
+		const response = await PATCH(
+			event('accounts/account-alice', 'PATCH', { name: '  Personal  ' })
+		);
+		expect(response.status).toBe(200);
+		const after = await response.json();
+		expect(after.accounts[0].name).toBe('Personal');
+		expect(after.accounts[0].email).toBe('alice@example.com');
+		expect(after.revision).toBeGreaterThan(before.revision);
+	});
+	test('rejects invalid labels and accounts owned by another user', async () => {
+		for (const name of ['', '   ', 'a'.repeat(101), 123]) {
+			expect((await PATCH(event('accounts/account-alice', 'PATCH', { name }))).status).toBe(400);
+		}
+		expect((await PATCH(event('accounts/account-bob', 'PATCH', { name: 'Changed' }))).status).toBe(
+			404
+		);
+		expect(snapshot('bob').accounts[0].name).toBe('bob');
 	});
 });

@@ -86,6 +86,31 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		const input = await body(event);
 		return json(await serialized(uid, () => connectAccount(uid, input)), { status: 201 });
 	}
+	if (path.startsWith('accounts/') && method === 'PATCH') {
+		const { name } = await body(event);
+		assert(
+			typeof name === 'string' && name.trim().length > 0 && name.trim().length <= 100,
+			'Account label must be between 1 and 100 characters'
+		);
+		return serialized(uid, async () => {
+			const id = path.slice(9);
+			const account = one<{ data: string }>(
+				'SELECT data FROM accounts WHERE id=? AND user_id=?',
+				id,
+				uid
+			);
+			assert(account, 'Account not found', 404);
+			db.transaction(() => {
+				db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
+					JSON.stringify({ ...JSON.parse(account.data), name: name.trim() }),
+					id,
+					uid
+				);
+				bump(uid);
+			})();
+			return json(snapshot(uid));
+		});
+	}
 	if (path.startsWith('accounts/') && method === 'DELETE')
 		return serialized(uid, async () => {
 			const id = path.slice(9);

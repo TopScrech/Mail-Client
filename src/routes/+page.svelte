@@ -461,6 +461,21 @@
 		onremovepasskey={(id) => remove(`passkeys/${encodeURIComponent(id)}`)}
 		onrevoke={(id) => remove(`sessions/${id}`)}
 		ondisconnect={(id) => remove(`accounts/${id}`)}
+		onrename={async (id, name) => {
+			if (busy) return false;
+			if (demo) {
+				mailbox.accounts = mailbox.accounts.map((account) =>
+					account.id === id ? { ...account, name } : account
+				);
+				return true;
+			}
+			let saved = false;
+			await action(async () => {
+				mailbox = await api(`accounts/${encodeURIComponent(id)}`, 'PATCH', { name });
+				saved = true;
+			});
+			return saved;
+		}}
 		onlogout={() => {
 			if (demo) {
 				settings = false;

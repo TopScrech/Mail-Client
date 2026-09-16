@@ -15,6 +15,7 @@
 		onremovepasskey,
 		onrevoke,
 		ondisconnect,
+		onrename,
 		onlogout,
 		onconnect
 	}: {
@@ -30,10 +31,13 @@
 		onremovepasskey: (id: string) => void;
 		onrevoke: (id: string) => void;
 		ondisconnect: (id: string) => void;
+		onrename: (id: string, name: string) => Promise<boolean>;
 		onlogout: () => void;
 		onconnect: () => void;
 	} = $props();
 	let disconnectId = $state('');
+	let editingId = $state('');
+	let accountLabel = $state('');
 	const date = (value: string) =>
 		new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 	function device(label: string) {
@@ -51,21 +55,25 @@
 		<div class="identity">
 			<span class="profile-avatar large">{profile.name.charAt(0)}</span>
 			<div>
-				<strong>{profile.name}</strong><small>{profile.email || 'Apple account'}</small><span
-					class="identity-badge">{demo ? 'Sample workspace' : ' Connected with Apple'}</span
-				>
+				<strong>{profile.name}</strong><small>{profile.email || 'Apple account'}</small>
 			</div>
 		</div>
 		<section class="settings-section">
 			<header>
-				<h3>Passkeys</h3>
+				<div class="settings-heading">
+					<h3>Passkeys</h3>
+					<button
+						type="button"
+						class="passkey-help"
+						aria-label="About passkeys"
+						title="An alternative way to sign in with your fingerprint, face, or device passcode"
+						>?</button
+					>
+				</div>
 				<button class="text-button accent" disabled={busy || demo} onclick={onaddpasskey}
 					><Icon name="plus" size={15} /> Add passkey</button
 				>
 			</header>
-			<p class="field-help">
-				An alternative way to sign in with your fingerprint, face, or device passcode
-			</p>
 			{#each profile.passkeys as key}<div class="settings-row">
 					<Icon name="key" size={18} />
 					<div><strong>Passkey</strong><small>Added {date(key.createdAt)}</small></div>
@@ -106,10 +114,41 @@
 					</div>
 					<button
 						class="text-button"
+						disabled={busy}
+						onclick={() => {
+							editingId = account.id;
+							accountLabel = account.name;
+						}}>Rename</button
+					>
+					<button
+						class="text-button"
 						disabled={busy || demo}
 						onclick={() => (disconnectId = account.id)}>Disconnect</button
 					>
 				</div>
+				{#if editingId === account.id}<form
+						class="account-label-form"
+						onsubmit={async (event) => {
+							event.preventDefault();
+							if (await onrename(account.id, accountLabel.trim())) editingId = '';
+						}}
+					>
+						<label
+							>Account label<input
+								bind:value={accountLabel}
+								required
+								maxlength="100"
+								disabled={busy}
+							/></label
+						>
+						<button
+							class="text-button"
+							type="button"
+							disabled={busy}
+							onclick={() => (editingId = '')}>Cancel</button
+						>
+						<button class="secondary" disabled={busy || !accountLabel.trim()}>Save</button>
+					</form>{/if}
 				{#if disconnectId === account.id}<div class="disconnect-confirm">
 						<p>
 							Disconnect {account.name} from this workspace on all devices?<br />Cached messages and
@@ -131,9 +170,6 @@
 				<h3>Signed-in devices</h3>
 				<Icon name="cloud" size={17} />
 			</header>
-			<p class="field-help">
-				Accounts, saved drafts, and message changes sync across your signed-in devices
-			</p>
 			{#each profile.sessions as session}<div class="settings-row">
 					<Icon name="device" size={19} />
 					<div>
@@ -154,6 +190,6 @@
 	<footer class="modal-footer">
 		<button class="text-button danger" disabled={busy} onclick={onlogout}
 			><Icon name="logout" size={17} /> {demo ? 'Exit preview' : 'Sign out'}</button
-		><span class="spacer"></span><button class="secondary" onclick={onclose}>Done</button>
+		>
 	</footer></Modal
 >
