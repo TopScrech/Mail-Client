@@ -2,6 +2,7 @@ import { ImapFlow } from 'imapflow';
 import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
 import { simpleParser } from 'mailparser';
+import { parseMessageBody } from './message-body';
 import { db, one, all, bump } from './db';
 import { encrypt, decrypt } from './crypto';
 import { allowedHosts, assert, string, ApiError } from './config';
@@ -201,27 +202,22 @@ export async function syncAccount(userId: string, id: string) {
 						messageId,
 						userId
 					);
-					let text = '';
-					let attachments: Message['attachments'] = [];
-					if (existing) {
-						const cached: Message = JSON.parse(existing.data);
-						text = cached.text;
-						attachments = cached.attachments;
-					} else if ((header.size || 0) <= 20 * 1024 * 1024) {
-						const source = await client.fetchOne(header.uid, { source: true }, { uid: true });
-						if (source && source.source) {
-							const parsed = await simpleParser(source.source, {
-								skipHtmlToText: false,
-								skipTextToHtml: true
-							});
-							text = (parsed.text || '').slice(0, 200_000);
-							attachments = parsed.attachments.map((x, index) => ({
-								index,
-								filename: x.filename || 'Attachment',
-								size: x.size
-							}));
+					const cached: Message | undefined = existing ? JSON.parse(existing.data) : undefined;
+					let text = cached?.text || '';
+					let html = cached?.html;
+					let attachments: Message['attachments'] = cached?.attachments || [];
+					// Undefined marks messages cached before HTML support and retries failed body fetches
+					if (html === undefined) {
+						if ((header.size || 0) <= 20 * 1024 * 1024) {
+							const source = await client.fetchOne(header.uid, { source: true }, { uid: true });
+							if (source && source.source) {
+								({ text, html, attachments } = await parseMessageBody(source.source));
+							}
+						} else {
+							text = 'This message is larger than 20 MB — open it in your provider’s client';
+							html = null;
 						}
-					} else text = 'This message is larger than 20 MB — open it in your provider’s client';
+					}
 					messages.push({
 						id: messageId,
 						accountId: id,
@@ -234,6 +230,7 @@ export async function syncAccount(userId: string, id: string) {
 						to: envelope.to?.map((x) => x.address).join(', ') || '',
 						subject: envelope.subject || '(No subject)',
 						text,
+						html,
 						date: envelope.date?.toISOString() || now(),
 						read: header.flags?.has('\\Seen') || false,
 						starred: header.flags?.has('\\Flagged') || false,

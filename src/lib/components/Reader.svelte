@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Icon from './Icon.svelte';
+	import HtmlMessage from './HtmlMessage.svelte';
 	import type { Message } from '$lib/types';
 	let {
 		message,
@@ -81,7 +82,11 @@
 					}).format(new Date(message.date))}</time
 				>
 			</div>
-			<div class="mail-body">{message.text || 'This message has no text content'}</div>
+			{#if message.html}
+				<HtmlMessage html={message.html} />
+			{:else}
+				<div class="mail-body">{message.text || 'This message has no text content'}</div>
+			{/if}
 			{#if message.attachments.length}<div class="attachments">
 					{#each message.attachments as file}<a
 							href={`/api/v1/attachment?id=${encodeURIComponent(message.id)}&index=${file.index}`}

@@ -26,6 +26,7 @@ export interface Message {
 	to: string;
 	subject: string;
 	text: string;
+	html?: string | null;
 	date: string;
 	read: boolean;
 	starred: boolean;
