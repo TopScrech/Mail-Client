@@ -24,6 +24,7 @@
 	let busy = $state(false);
 	let syncing = $state(false);
 	let error = $state('');
+	let mailOAuth = $state({ google: false, microsoft: false });
 	let toast = $state('');
 	let connect = $state(false);
 	let settings = $state(false);
@@ -296,6 +297,7 @@
 			try {
 				const config = await api('config');
 				appleEnabled = config.appleEnabled;
+				mailOAuth = config.mailOAuth;
 				try {
 					await loadProfile();
 					await pull();
@@ -304,7 +306,16 @@
 					if (!(e instanceof RequestError && e.status === 401)) throw e;
 				}
 				if (!profile && new URL(location.href).searchParams.get('demo') === '1') preview();
-				const authError = new URL(location.href).searchParams.get('authError');
+				const params = new URL(location.href).searchParams;
+				if (params.has('mailError')) {
+					connect = true;
+					error = params.get('mailError') || 'Mail connection failed';
+					history.replaceState(null, '', '/');
+				} else if (params.has('mailConnected')) {
+					settings = true;
+					history.replaceState(null, '', '/');
+				}
+				const authError = params.get('authError');
 				if (authError) {
 					error = authError;
 					history.replaceState(null, '', '/');
@@ -419,6 +430,8 @@
 			</div>{/if}
 	</div>{/if}
 {#if connect}<ConnectAccount
+		{demo}
+		{mailOAuth}
 		{busy}
 		{error}
 		onclose={() => {

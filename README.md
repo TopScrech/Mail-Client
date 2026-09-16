@@ -156,3 +156,37 @@ The SF Pro glyph coverage was checked against all 24 mapped icons on the develop
 ## Coolify
 
 See [COOLIFY.md](COOLIFY.md) for runtime environment variables, Apple return URL, and persistent volume configuration
+
+## Google and Microsoft mail accounts
+
+Workspace creation still uses Apple, with passkeys for subsequent sign-in
+In Settings → Mail accounts → Connect, Gmail and Outlook / Microsoft 365 redirect to the provider's authorization page
+Tokens are encrypted with the existing `ENCRYPTION_KEY` and renewed server-side for every device
+Connect the same email again to renew authorization without removing its label or drafts
+
+Add these runtime environment variables in Coolify and redeploy:
+
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `MICROSOFT_CLIENT_ID`
+- `MICROSOFT_CLIENT_SECRET`
+
+Keep `ORIGIN=https://mail.topscrech.dev` and the existing encryption key
+A provider is unavailable until both its client ID and client secret are set
+
+For Google, create a Web application OAuth client in Google Cloud and configure the consent screen with `openid`, `email`, and `https://mail.google.com/`
+Register `https://mail.topscrech.dev/api/v1/mail/oauth/google/callback` as an authorized redirect URI
+Add your Google account as a test user while the consent screen is in Testing
+Google's full-mail scope for IMAP/SMTP is restricted; public distribution requires Google's verification process and may require a security assessment
+Testing-mode refresh tokens for these scopes generally expire after seven days
+See [Google web-server OAuth](https://developers.google.com/identity/protocols/oauth2/web-server) and [Gmail OAuth scopes](https://developers.google.com/workspace/gmail/imap/xoauth2-protocol)
+
+For Microsoft, register a Web app in Microsoft Entra supporting accounts in any organizational directory and personal Microsoft accounts
+Register `https://mail.topscrech.dev/api/v1/mail/oauth/microsoft/callback` and create a client secret (use its value, not its ID)
+Configure delegated Exchange Online permissions `IMAP.AccessAsUser.All` and `SMTP.Send`, plus OpenID `openid`, `email`, `profile`, and `offline_access`
+The app uses the common tenant endpoint for Outlook.com and Microsoft 365
+IMAP and authenticated SMTP must be enabled for the mailbox; organization policies may require administrator consent or block these protocols
+See [Microsoft mail OAuth](https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth)
+
+For local testing, register the corresponding `http://localhost:5173/api/v1/mail/oauth/<provider>/callback` URI on a development OAuth client
+Never expose client secrets or tokens to the browser or commit them to Git

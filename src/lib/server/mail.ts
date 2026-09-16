@@ -5,16 +5,13 @@ import { simpleParser } from 'mailparser';
 import { db, one, all, bump } from './db';
 import { encrypt, decrypt } from './crypto';
 import { allowedHosts, assert, string, ApiError } from './config';
+import { refreshOAuth, type Credentials } from './mail-oauth';
 import type { MailAccount, Message, Folder, Draft } from '$lib/types';
 interface AccountRow {
 	id: string;
 	user_id: string;
 	data: string;
 	secret: string;
-}
-interface Credentials {
-	username: string;
-	password: string;
 }
 const now = () => new Date().toISOString();
 const locks = new Map<string, Promise<unknown>>();
@@ -37,6 +34,18 @@ export function account(userId: string, id: string) {
 		credentials: JSON.parse(decrypt(row.secret, `${userId}:${id}`)) as Credentials
 	};
 }
+async function authorizedAccount(userId: string, id: string) {
+	const result = account(userId, id);
+	if (result.credentials.oauth) {
+		result.credentials.oauth = await refreshOAuth(result.credentials.oauth);
+		db.query('UPDATE accounts SET secret=? WHERE id=? AND user_id=?').run(
+			encrypt(JSON.stringify(result.credentials), `${userId}:${id}`),
+			id,
+			userId
+		);
+	}
+	return result;
+}
 function validateHost(host: string) {
 	assert(
 		allowedHosts().includes(host.toLowerCase()),
@@ -49,7 +58,9 @@ function imap(data: MailAccount, credentials: Credentials) {
 		host: data.imapHost,
 		port: 993,
 		secure: true,
-		auth: { user: credentials.username, pass: credentials.password },
+		auth: credentials.oauth
+			? { user: credentials.username, accessToken: credentials.oauth.accessToken }
+			: { user: credentials.username, pass: credentials.password! },
 		logger: false,
 		connectionTimeout: 15_000,
 		greetingTimeout: 15_000,
@@ -66,7 +77,9 @@ function smtp(data: MailAccount, credentials: Credentials) {
 		port: data.smtpPort,
 		secure: data.smtpPort === 465,
 		requireTLS: true,
-		auth: { user: credentials.username, pass: credentials.password },
+		auth: credentials.oauth
+			? { type: 'OAuth2', user: credentials.username, accessToken: credentials.oauth.accessToken }
+			: { user: credentials.username, pass: credentials.password! },
 		tls: { rejectUnauthorized: true },
 		connectionTimeout: 15_000,
 		greetingTimeout: 15_000,
@@ -75,11 +88,23 @@ function smtp(data: MailAccount, credentials: Credentials) {
 		disableUrlAccess: true
 	});
 }
-export async function connectAccount(userId: string, input: Record<string, unknown>) {
+export async function connectAccount(
+	userId: string,
+	input: Record<string, unknown>,
+	oauthCredentials?: Credentials
+) {
+	const existing = oauthCredentials
+		? all<{ id: string; data: string }>(
+				'SELECT id,data FROM accounts WHERE user_id=?',
+				userId
+			).find(
+				(row) => JSON.parse(row.data).email.toLowerCase() === String(input.email).toLowerCase()
+			)
+		: undefined;
 	const data: MailAccount = {
-		id: crypto.randomUUID(),
+		id: existing?.id || crypto.randomUUID(),
 		email: string(input.email, 'email address'),
-		name: string(input.name, 'account name', 80),
+		name: existing ? JSON.parse(existing.data).name : string(input.name, 'account name', 80),
 		imapHost: string(input.imapHost, 'IMAP host').toLowerCase(),
 		smtpHost: string(input.smtpHost, 'SMTP host').toLowerCase(),
 		smtpPort: Number(input.smtpPort),
@@ -89,12 +114,12 @@ export async function connectAccount(userId: string, input: Record<string, unkno
 	assert(/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(data.email), 'Enter a valid email address');
 	assert([465, 587].includes(data.smtpPort), 'Use SMTP port 465 or 587');
 	assert(
-		all('SELECT id FROM accounts WHERE user_id=?', userId).length < 10,
+		existing || all('SELECT id FROM accounts WHERE user_id=?', userId).length < 10,
 		'A workspace supports up to 10 mail accounts'
 	);
 	validateHost(data.imapHost);
 	validateHost(data.smtpHost);
-	const credentials = {
+	const credentials: Credentials = oauthCredentials || {
 		username: string(input.username || input.email, 'username'),
 		password:
 			typeof input.password === 'string' &&
@@ -110,18 +135,20 @@ export async function connectAccount(userId: string, input: Record<string, unkno
 		await client.connect();
 		await transport.verify();
 	} catch {
-		throw new ApiError(422, 'Connection failed — check the servers, username, and app password');
+		throw new ApiError(
+			422,
+			oauthCredentials
+				? 'Connection failed — ensure IMAP and authenticated SMTP are enabled for this mailbox'
+				: 'Connection failed — check the servers, username, and app password'
+		);
 	} finally {
 		await client.logout().catch(() => {});
 		transport.close();
 	}
 	db.transaction(() => {
-		db.query('INSERT INTO accounts VALUES (?,?,?,?)').run(
-			data.id,
-			userId,
-			JSON.stringify(data),
-			secret
-		);
+		db.query(
+			'INSERT INTO accounts VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, secret=excluded.secret'
+		).run(data.id, userId, JSON.stringify(data), secret);
 		bump(userId);
 	})();
 	return data;
@@ -143,7 +170,7 @@ async function destination(client: ImapFlow, folder: Folder) {
 	return entry.path;
 }
 export async function syncAccount(userId: string, id: string) {
-	const { data, credentials } = account(userId, id);
+	const { data, credentials } = await authorizedAccount(userId, id);
 	const client = imap(data, credentials);
 	const messages: Message[] = [];
 	try {
@@ -232,7 +259,7 @@ export async function syncAccount(userId: string, id: string) {
 			bump(userId);
 		})();
 	} catch {
-		data.error = 'Could not sync this account — check your connection and app password';
+		data.error = 'Could not sync this account — check your connection or reconnect the account';
 		db.transaction(() => {
 			db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
 				JSON.stringify(data),
@@ -261,7 +288,7 @@ export async function updateMessage(
 	change: { read?: boolean; starred?: boolean; folder?: Folder }
 ) {
 	const mail = message(userId, id);
-	const { data, credentials } = account(userId, mail.accountId);
+	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
 	const client = imap(data, credentials);
 	try {
 		await client.connect();
@@ -305,7 +332,7 @@ export async function attachment(userId: string, id: string, index: number) {
 		'Attachment not found',
 		404
 	);
-	const { data, credentials } = account(userId, mail.accountId);
+	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
 	const client = imap(data, credentials);
 	try {
 		await client.connect();
@@ -348,7 +375,7 @@ export async function send(
 	);
 	if (old?.state === 'sent') return { ok: true };
 	assert(!old, 'Delivery is already in progress or uncertain — check Sent before retrying', 409);
-	const { data, credentials } = account(userId, draft.accountId);
+	const { data, credentials } = await authorizedAccount(userId, draft.accountId);
 	assert(
 		draft.to.length <= 2000 &&
 			draft.to.split(',').every((x) => /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(x.trim())),

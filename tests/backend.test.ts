@@ -280,3 +280,87 @@ describe('Account labels', () => {
 		expect(snapshot('bob').accounts[0].name).toBe('bob');
 	});
 });
+
+describe('Mailbox OAuth', () => {
+	test('requires a workspace session before connecting', async () => {
+		expect((await GET(event('mail/oauth/google/start', 'GET', undefined, null))).status).toBe(303);
+		expect(one('SELECT id FROM challenges')).toBeNull();
+	});
+	test('uses provider authorization with PKCE and rejects state mismatch', async () => {
+		process.env.GOOGLE_CLIENT_ID = 'test-google';
+		process.env.GOOGLE_CLIENT_SECRET = 'test-secret';
+		const start = event('mail/oauth/google/start');
+		const response = await GET(start);
+		const location = new URL(response.headers.get('location')!);
+		expect(location.origin).toBe('https://accounts.google.com');
+		expect(location.searchParams.get('code_challenge_method')).toBe('S256');
+		expect(location.searchParams.get('access_type')).toBe('offline');
+		expect(location.searchParams.get('scope')).toContain('https://mail.google.com/');
+		const callback = event(`mail/oauth/google/callback?state=wrong&code=fake`);
+		callback.cookies = start.cookies;
+		const rejected = await GET(callback);
+		expect(rejected.headers.get('location')).toContain('mailError=');
+		expect(snapshot('alice').accounts).toHaveLength(1);
+	});
+	test('rejects callbacks from a different workspace session and consumes state', async () => {
+		process.env.MICROSOFT_CLIENT_ID = 'test-microsoft';
+		process.env.MICROSOFT_CLIENT_SECRET = 'test-secret';
+		const start = event('mail/oauth/microsoft/start');
+		const response = await GET(start);
+		const location = new URL(response.headers.get('location')!);
+		expect(location.origin).toBe('https://login.microsoftonline.com');
+		expect(location.searchParams.get('scope')).toContain('SMTP.Send');
+		const callback = event(
+			`mail/oauth/microsoft/callback?state=${location.searchParams.get('state')}&code=fake`,
+			'GET',
+			undefined,
+			'bob'
+		);
+		callback.cookies = start.cookies;
+		const rejected = await GET(callback);
+		expect(decodeURIComponent(rejected.headers.get('location')!)).toContain('another session');
+		expect(one('SELECT id FROM challenges')).toBeNull();
+	});
+	test('keeps unexpired tokens without contacting provider', async () => {
+		const { refreshOAuth } = await import('../src/lib/server/mail-oauth');
+		const tokens = {
+			provider: 'google' as const,
+			accessToken: 'access',
+			refreshToken: 'refresh',
+			expiresAt: Date.now() + 3600000
+		};
+		expect(await refreshOAuth(tokens)).toBe(tokens);
+	});
+});
+
+test('OAuth renewal rotates refresh tokens and reports revoked access safely', async () => {
+	const { refreshOAuth } = await import('../src/lib/server/mail-oauth');
+	const originalFetch = globalThis.fetch;
+	const tokens = {
+		provider: 'google' as const,
+		accessToken: 'old-access',
+		refreshToken: 'old-refresh',
+		expiresAt: 0
+	};
+	try {
+		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+			expect(String(init?.body)).toContain('grant_type=refresh_token');
+			expect(String(init?.body)).toContain('refresh_token=old-refresh');
+			return Response.json({
+				access_token: 'new-access',
+				refresh_token: 'new-refresh',
+				expires_in: 3600,
+				token_type: 'Bearer'
+			});
+		}) as typeof fetch;
+		const updated = await refreshOAuth(tokens);
+		expect(updated.accessToken).toBe('new-access');
+		expect(updated.refreshToken).toBe('new-refresh');
+		expect(updated.expiresAt).toBeGreaterThan(Date.now());
+		globalThis.fetch = (async () =>
+			Response.json({ error: 'invalid_grant' }, { status: 400 })) as typeof fetch;
+		expect(refreshOAuth(tokens)).rejects.toThrow('connect the account again');
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+});

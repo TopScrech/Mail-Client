@@ -1,3 +1,9 @@
+import {
+	mailProvider,
+	oauthConfigured,
+	mailOAuthStart,
+	mailOAuthCallback
+} from '$lib/server/mail-oauth';
 import { json, type RequestEvent } from '@sveltejs/kit';
 import { ApiError, assert, origin, appleConfigured, allowedHosts } from '$lib/server/config';
 import { db, one, all, limit, cleanup, bump, snapshot, type User } from '$lib/server/db';
@@ -44,7 +50,11 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		limit(`auth:${hash(event.getClientAddress())}`, 30);
 	}
 	if (path === 'config' && method === 'GET')
-		return json({ appleEnabled: appleConfigured(), mailHosts: allowedHosts() });
+		return json({
+			appleEnabled: appleConfigured(),
+			mailHosts: allowedHosts(),
+			mailOAuth: { google: oauthConfigured('google'), microsoft: oauthConfigured('microsoft') }
+		});
 	if (path === 'auth/apple/start' && method === 'GET')
 		return new Response(null, { status: 302, headers: { location: appleStart(event) } });
 	if (path === 'auth/apple/callback' && method === 'POST')
@@ -55,6 +65,34 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return json(await passkeyVerify(event, false, await body(event)));
 	const auth = requireSession(event);
 	const uid = auth.user_id;
+	if (path.startsWith('mail/oauth/') && method === 'GET') {
+		const [, , providerName, operation] = path.split('/');
+		const provider = mailProvider(providerName);
+		if (operation === 'start') {
+			limit(`connect:${uid}`, 10, 3600_000);
+			return new Response(null, {
+				status: 302,
+				headers: { location: mailOAuthStart(event, provider) }
+			});
+		}
+		if (operation === 'callback') {
+			const { email, credentials } = await mailOAuthCallback(event, provider);
+			await serialized(uid, async () => {
+				await connectAccount(
+					uid,
+					{
+						email,
+						name: email,
+						imapHost: provider === 'google' ? 'imap.gmail.com' : 'outlook.office365.com',
+						smtpHost: provider === 'google' ? 'smtp.gmail.com' : 'smtp.office365.com',
+						smtpPort: provider === 'google' ? 465 : 587
+					},
+					credentials
+				);
+			});
+			return new Response(null, { status: 303, headers: { location: '/?mailConnected=1' } });
+		}
+	}
 	if (path === 'me' && method === 'GET') return json(profile(event));
 	if (path === 'auth/passkey/register/options' && method === 'POST')
 		return json(await passkeyOptions(event, true, false));
@@ -311,6 +349,14 @@ async function handle(event: RequestEvent) {
 		const status = error instanceof ApiError ? error.status : 500;
 		const message =
 			error instanceof ApiError ? error.message : 'The request could not be completed';
+		if (event.params.path?.startsWith('mail/oauth/'))
+			return new Response(null, {
+				status: 303,
+				headers: {
+					location: `/?mailError=${encodeURIComponent(message)}`,
+					'cache-control': 'no-store'
+				}
+			});
 		if (event.params.path === 'auth/apple/callback')
 			return new Response(null, {
 				status: 303,
