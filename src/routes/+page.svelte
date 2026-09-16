@@ -20,6 +20,10 @@
 	let folder = $state<Folder>('inbox');
 	let selectedAccount = $state('');
 	let selected = $state('');
+	let restoredSelectionKey = $state('');
+	let selectionKey = $derived(
+		demo ? 'mail-selection:demo' : profile ? `mail-selection:user:${profile.id}` : ''
+	);
 	let query = $state('');
 	let busy = $state(false);
 	let syncing = $state(false);
@@ -53,6 +57,39 @@
 		)
 	);
 	let active = $derived(mailbox.messages.find((m) => m.id === selected));
+	function restoreSelection() {
+		selected = '';
+		selectedAccount = '';
+		folder = 'inbox';
+		query = '';
+		mobileReading = false;
+		try {
+			const saved = JSON.parse(localStorage.getItem(selectionKey) || 'null');
+			const message = mailbox.messages.find((message) => message.id === saved?.selected);
+			if (message) {
+				selected = message.id;
+				selectedAccount = saved.selectedAccount === message.accountId ? message.accountId : '';
+				folder =
+					saved.folder === 'starred' && message.starred && message.folder !== 'trash'
+						? 'starred'
+						: message.folder;
+				query = typeof saved.query === 'string' ? saved.query : '';
+				mobileReading = saved.mobileReading !== false;
+			}
+		} catch {
+			// Selection persistence is optional when browser storage is unavailable
+		}
+		restoredSelectionKey = selectionKey;
+	}
+	$effect(() => {
+		if (!selectionKey || restoredSelectionKey !== selectionKey) return;
+		const selection = JSON.stringify({ selected, selectedAccount, folder, query, mobileReading });
+		try {
+			localStorage.setItem(selectionKey, selection);
+		} catch {
+			// Keep mail usable when browser storage is unavailable
+		}
+	});
 	function notice(message: string) {
 		toast = message;
 		clearTimeout(toastTimer);
@@ -80,7 +117,11 @@
 		try {
 			const next = await api<Snapshot | null>(`sync?since=${mailbox.revision}`);
 			if (profile?.id !== userId) return;
-			if (next && next.revision > mailbox.revision) mailbox = next;
+			if (next && next.revision > mailbox.revision) {
+				const initialLoad = mailbox.revision === -1;
+				mailbox = next;
+				if (initialLoad) restoreSelection();
+			}
 			syncWarning = '';
 		} catch (e) {
 			if (e instanceof RequestError && e.status === 401) {
@@ -124,7 +165,8 @@
 	function preview() {
 		demo = true;
 		mailbox = demoSnapshot();
-		selected = mailbox.messages[0].id;
+		restoreSelection();
+		if (!selected) selected = mailbox.messages[0].id;
 		error = '';
 	}
 	function leavePreview() {
