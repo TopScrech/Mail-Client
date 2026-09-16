@@ -2,10 +2,10 @@
 
 A minimal email client built with Svelte 5, SvelteKit, and Bun, with the dark navy palette, blue selection, compact controls, and split panes of SFTP Otter
 
-## Implemented
+## Features
 
-- Sign in with Apple creates the workspace — no anonymous or email/password registration
-- Authenticated users can add passkeys, then use them as an alternative sign-in method
+- Sign in with Apple
+- Passkeys
 - One shared workspace across devices, with connected mail accounts, saved drafts, and message state stored on the server
 - IMAP inbox, sent, archive, trash, stars, read state, search within cached mail, and account filtering in Settings
 - SMTP compose, replies, multiple recipients, and file attachments
