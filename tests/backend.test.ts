@@ -358,7 +358,7 @@ test('OAuth renewal rotates refresh tokens and reports revoked access safely', a
 		expect(updated.refreshToken).toBe('new-refresh');
 		expect(updated.expiresAt).toBeGreaterThan(Date.now());
 		globalThis.fetch = (async () =>
-			Response.json({ error: 'invalid_grant' }, { status: 400 })) as typeof fetch;
+			Response.json({ error: 'invalid_grant' }, { status: 400 })) as unknown as typeof fetch;
 		expect(refreshOAuth(tokens)).rejects.toThrow('connect the account again');
 	} finally {
 		globalThis.fetch = originalFetch;

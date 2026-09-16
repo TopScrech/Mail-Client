@@ -53,7 +53,7 @@
 	}
 </script>
 
-<Modal title="Connect a mail account" {onclose}
+<Modal title="Connect a mail account" subtitle="Connect once and find your mail on every device" {onclose}
 	><form
 		onsubmit={(e) => {
 			e.preventDefault();
@@ -74,7 +74,6 @@
 		}}
 	>
 		<div class="modal-body">
-			<p class="muted">Connect once and find your mail on every device</p>
 			<label
 				>Provider<select value={provider} onchange={(e) => changeProvider(e.currentTarget.value)}
 					><option value="icloud">iCloud Mail</option><option value="gmail">Gmail</option><option
@@ -85,9 +84,6 @@
 				></label
 			>
 			{#if oauth}
-				<p class="field-help">
-					Continue to {provider === 'gmail' ? 'Google' : 'Microsoft'} to authorize access to your mail
-				</p>
 				{#if demo}<p class="field-help">Sign in to your workspace to connect a mail account</p>
 				{:else if !mailOAuth[oauthProvider]}<p class="field-help">
 						This provider has not been configured on the server yet

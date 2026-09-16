@@ -967,6 +967,11 @@ dialog::backdrop {
 	font-weight: 550;
 	letter-spacing: -0.4px;
 }
+.modal-subtitle {
+	margin: 6px 0 0;
+	font-size: 13px;
+	color: var(--muted);
+}
 .modal-body {
 	padding: 25px;
 	display: flex;
