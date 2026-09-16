@@ -7,3 +7,5 @@ build/
 data/
 *.sqlite*
 work/
+
+.idea/
