@@ -196,6 +196,10 @@
 		};
 	}
 	async function saveDraft(draft: Draft) {
+		if (!draft.to.trim() && !draft.subject.trim() && !draft.text.trim() && !draft.updatedAt) {
+			composer = null;
+			return;
+		}
 		if (demo) {
 			mailbox.drafts = [
 				...mailbox.drafts.filter((d) => d.id !== draft.id),

@@ -26,9 +26,18 @@
 	let files = $state<File[]>([]);
 	let upload: HTMLInputElement;
 	const requestId = crypto.randomUUID();
+	function closeComposer() {
+		const unchanged =
+			local.to === draft.to &&
+			local.subject === draft.subject &&
+			local.text === draft.text &&
+			local.accountId === draft.accountId;
+		if (unchanged) onclose();
+		else onsave(local);
+	}
 </script>
 
-<Modal title={draft.replyTo ? 'Reply' : 'New message'} onclose={() => onsave(local)} wide
+<Modal title={draft.replyTo ? 'Reply' : 'New message'} onclose={closeComposer} wide
 	><form
 		onsubmit={(e) => {
 			e.preventDefault();
