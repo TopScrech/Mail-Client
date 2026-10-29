@@ -51,6 +51,8 @@ Accounts with rejected mail credentials report `reconnectRequired: true` and a r
 
 For Google and Microsoft accounts, repeat the mail OAuth flow with the same email to replace authorization while keeping the existing account and cached mail
 
+Message updates return `{ ok: true, ...Snapshot }` after the provider confirms the change, allowing clients to reconcile immediately without another fetch
+
 Message identifiers include the account, folder path, UIDVALIDITY, and UID — treat them as opaque strings and URI-encode them where needed
 
 ## Draft conflicts

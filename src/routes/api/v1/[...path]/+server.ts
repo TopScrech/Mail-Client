@@ -199,8 +199,10 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 			assert(['inbox', 'archive', 'trash'].includes(input.folder), 'Invalid destination');
 			change.folder = input.folder;
 		}
-		await serialized(uid, () => updateMessage(uid, input.id, change));
-		return json({ ok: true });
+		return serialized(uid, async () => {
+			await updateMessage(uid, input.id, change);
+			return json({ ok: true, ...snapshot(uid) });
+		});
 	}
 	if (path === 'attachment' && method === 'GET') {
 		limit(`attachment:${uid}`, 30);

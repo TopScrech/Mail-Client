@@ -39,8 +39,14 @@
 	let mobileSidebar = $state(false);
 	let syncWarning = $state('');
 	let toastTimer: ReturnType<typeof setTimeout>;
+	let pendingMoves = $state<Record<string, boolean>>({});
+	const messageChanges = new Map<string, Promise<void>>();
+	let visibleMailbox = $derived({
+		...mailbox,
+		messages: mailbox.messages.filter((message) => !pendingMoves[message.id])
+	});
 	let messages = $derived(
-		mailbox.messages
+		visibleMailbox.messages
 			.filter(
 				(m) =>
 					(!selectedAccount || m.accountId === selectedAccount) &&
@@ -58,7 +64,7 @@
 				`${d.to} ${d.subject} ${d.text}`.toLocaleLowerCase().includes(query.toLocaleLowerCase())
 		)
 	);
-	let active = $derived(mailbox.messages.find((m) => m.id === selected));
+	let active = $derived(visibleMailbox.messages.find((m) => m.id === selected));
 	function restoreSelection() {
 		selected = '';
 		selectedAccount = '';
@@ -239,15 +245,37 @@
 			}
 			return;
 		}
-		await action(async () => {
-			await api('messages', 'PATCH', { id: message.id, ...change });
-			if (change.folder) {
+		if (pendingMoves[message.id] || !profile) return;
+		const userId = profile.id;
+		if (change.folder) {
+			pendingMoves[message.id] = true;
+			if (selected === message.id) {
 				selected = '';
 				mobileReading = false;
 			}
-			await pull();
-			if (change.folder) void syncMail();
+		}
+		const previous = messageChanges.get(message.id) || Promise.resolve();
+		const operation = previous.then(async () => {
+			try {
+				if (profile?.id !== userId || demo) return;
+				const next = await api<Snapshot>('messages', 'PATCH', { id: message.id, ...change });
+				if (profile?.id !== userId || demo) return;
+				if (next.revision >= mailbox.revision) mailbox = next;
+				if (change.folder) void syncMail();
+			} catch (e) {
+				if (profile?.id !== userId || demo) return;
+				error = e instanceof Error ? e.message : 'Could not update this message';
+				notice(change.folder ? `Message could not be moved — ${error}` : error);
+			} finally {
+				if (change.folder) delete pendingMoves[message.id];
+			}
 		});
+		messageChanges.set(message.id, operation);
+		try {
+			await operation;
+		} finally {
+			if (messageChanges.get(message.id) === operation) messageChanges.delete(message.id);
+		}
 	}
 	function compose(reply = false) {
 		error = '';
@@ -476,7 +504,7 @@
 			</div>{/if}
 		<div class="workspace-panes">
 			<Sidebar
-				state={mailbox}
+				state={visibleMailbox}
 				{folder}
 				{selectedAccount}
 				name={profile?.name || 'Alex Morgan'}

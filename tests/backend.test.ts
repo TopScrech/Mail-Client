@@ -578,3 +578,82 @@ describe('Mail account reconnection', () => {
 		expect(snapshot('alice').accounts[0].reconnectRequired).toBe(true);
 	});
 });
+
+describe('Message move reconciliation', () => {
+	async function mockMove(failure = false) {
+		const { ImapFlow } = await import('imapflow');
+		const data = {
+			...snapshot('alice').accounts[0],
+			imapHost: 'imap.mail.me.com',
+			smtpHost: 'smtp.mail.me.com',
+			smtpPort: 587
+		};
+		db.query('UPDATE accounts SET data=?, secret=? WHERE id=?').run(
+			JSON.stringify(data),
+			encrypt(
+				JSON.stringify({ username: data.email, password: 'password' }),
+				'alice:account-alice'
+			),
+			data.id
+		);
+		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
+			'moving',
+			'alice',
+			data.id,
+			JSON.stringify({
+				id: 'moving',
+				accountId: data.id,
+				path: 'INBOX',
+				folder: 'inbox',
+				uid: 7,
+				uidValidity: '1'
+			})
+		);
+		const mocks = [
+			spyOn(ImapFlow.prototype, 'connect').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'list').mockResolvedValue([
+				{ path: 'Trash', specialUse: '\\Trash' }
+			] as never),
+			spyOn(ImapFlow.prototype, 'getMailboxLock').mockImplementation(async function (
+				this: InstanceType<typeof ImapFlow>
+			) {
+				this.mailbox = { uidValidity: 1n } as never;
+				return { release() {} } as never;
+			}),
+			spyOn(ImapFlow.prototype, 'messageMove').mockImplementation(async () => {
+				if (failure) throw new Error('Provider unavailable');
+				return true as never;
+			})
+		];
+		return () => mocks.forEach((mock) => mock.mockRestore());
+	}
+	test('move response includes the committed snapshot without another sync request', async () => {
+		const restore = await mockMove();
+		const revision = snapshot('alice').revision;
+		try {
+			const response = await PATCH(event('messages', 'PATCH', { id: 'moving', folder: 'trash' }));
+			expect(response.status).toBe(200);
+			const body = await response.json();
+			expect(body.ok).toBe(true);
+			expect(body.revision).toBeGreaterThan(revision);
+			expect(body.messages).toEqual([]);
+			expect(body.accounts[0].id).toBe('account-alice');
+		} finally {
+			restore();
+		}
+	});
+	test('failed provider move keeps the cached message available for rollback', async () => {
+		const restore = await mockMove(true);
+		const revision = snapshot('alice').revision;
+		try {
+			const response = await PATCH(event('messages', 'PATCH', { id: 'moving', folder: 'trash' }));
+			expect(response.status).toBe(500);
+			expect(snapshot('alice').revision).toBe(revision);
+			expect(snapshot('alice').messages[0].id).toBe('moving');
+			expect(snapshot('alice').messages[0].folder).toBe('inbox');
+		} finally {
+			restore();
+		}
+	});
+});

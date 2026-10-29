@@ -1225,7 +1225,7 @@ label > small {
 }
 @keyframes rotate {
 	to {
-		transform: rotate(360deg);
+		transform: rotate(-360deg);
 	}
 }
 @media (min-width: 1500px) {
