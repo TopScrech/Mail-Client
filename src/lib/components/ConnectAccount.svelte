@@ -1,7 +1,10 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Icon from './Icon.svelte';
+	import type { MailAccount } from '$lib/types';
 	let {
+		account = null,
 		onclose,
 		onconnect,
 		busy,
@@ -9,6 +12,7 @@
 		mailOAuth,
 		error
 	}: {
+		account?: MailAccount | null;
 		onclose: () => void;
 		onconnect: (data: Record<string, unknown>) => void;
 		busy: boolean;
@@ -16,18 +20,29 @@
 		mailOAuth: { google: boolean; microsoft: boolean };
 		error: string;
 	} = $props();
-	let provider = $state('icloud');
+	const initialAccount = untrack(() => account);
+	let provider = $state(
+		initialAccount?.imapHost === 'imap.gmail.com'
+			? 'gmail'
+			: initialAccount?.imapHost === 'outlook.office365.com'
+				? 'microsoft'
+				: initialAccount?.imapHost === 'imap.fastmail.com'
+					? 'fastmail'
+					: !initialAccount || initialAccount.imapHost === 'imap.mail.me.com'
+						? 'icloud'
+						: 'other'
+	);
 	let oauth = $derived(provider === 'gmail' || provider === 'microsoft');
 	let oauthProvider: 'google' | 'microsoft' = $derived(
 		provider === 'gmail' ? 'google' : 'microsoft'
 	);
-	let email = $state('');
-	let name = $state('Personal');
+	let email = $state(initialAccount?.email || '');
+	let name = $state(initialAccount?.name || 'Personal');
 	let username = $state('');
 	let password = $state('');
-	let imapHost = $state('imap.mail.me.com');
-	let smtpHost = $state('smtp.mail.me.com');
-	let smtpPort = $state(587);
+	let imapHost = $state(initialAccount?.imapHost || 'imap.mail.me.com');
+	let smtpHost = $state(initialAccount?.smtpHost || 'smtp.mail.me.com');
+	let smtpPort = $state(initialAccount?.smtpPort || 587);
 	function changeProvider(value: string) {
 		provider = value;
 		if (value === 'icloud') {
@@ -53,7 +68,12 @@
 	}
 </script>
 
-<Modal title="Connect a mail account" subtitle="Connect once and find your mail on every device" {onclose}
+<Modal
+	title={account ? 'Reconnect a mail account' : 'Connect a mail account'}
+	subtitle={account
+		? `Restore access to ${account.email}`
+		: 'Connect once and find your mail on every device'}
+	{onclose}
 	><form
 		onsubmit={(e) => {
 			e.preventDefault();
@@ -65,7 +85,7 @@
 			onconnect({
 				name,
 				email,
-				username: username || email,
+				username,
 				password,
 				imapHost,
 				smtpHost,
@@ -75,7 +95,10 @@
 	>
 		<div class="modal-body">
 			<label
-				>Provider<select value={provider} onchange={(e) => changeProvider(e.currentTarget.value)}
+				>Provider<select
+					value={provider}
+					disabled={!!account}
+					onchange={(e) => changeProvider(e.currentTarget.value)}
 					><option value="icloud">iCloud Mail</option><option value="gmail">Gmail</option><option
 						value="microsoft">Outlook / Microsoft 365</option
 					><option value="fastmail">Fastmail</option><option value="other"
@@ -83,6 +106,10 @@
 					></select
 				></label
 			>
+			{#if account}<p class="field-help">
+					Sign in again or enter a new app password to restore mail access — your cached messages
+					and drafts will be kept
+				</p>{/if}
 			{#if oauth}
 				{#if demo}<p class="field-help">Sign in to your workspace to connect a mail account</p>
 				{:else if !mailOAuth[oauthProvider]}<p class="field-help">
@@ -100,6 +127,7 @@
 					><label
 						>Email address<input
 							bind:value={email}
+							readonly={!!account}
 							type="email"
 							placeholder="you@example.com"
 							required
@@ -162,7 +190,9 @@
 					? 'Connecting…'
 					: oauth
 						? `Continue with ${provider === 'gmail' ? 'Google' : 'Microsoft'}`
-						: 'Connect account'}<Icon name="chevron" size={16} /></button
+						: account
+							? 'Reconnect account'
+							: 'Connect account'}<Icon name="chevron" size={16} /></button
 			>
 		</footer>
 	</form></Modal

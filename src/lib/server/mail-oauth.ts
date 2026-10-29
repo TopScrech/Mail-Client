@@ -5,6 +5,7 @@ import { assert, origin, secure, ApiError } from './config';
 import { opaque, hash } from './crypto';
 import { challenge, consume } from './db';
 import { requireSession } from './auth';
+import { MailAuthError } from './mail-errors';
 
 export type MailProvider = 'google' | 'microsoft';
 export interface OAuthTokens {
@@ -93,8 +94,17 @@ async function tokenRequest(provider: MailProvider, fields: Record<string, strin
 		body: new URLSearchParams({ ...client(provider), ...fields }),
 		signal: AbortSignal.timeout(15000)
 	});
-	if (!response.ok)
-		throw new ApiError(422, 'Mail authorization failed — connect the account again');
+	if (!response.ok) {
+		const failure = await response.json().catch(() => null);
+		if (
+			response.status < 500 &&
+			['invalid_grant', 'invalid_token', 'access_denied', 'interaction_required'].includes(
+				failure?.error
+			)
+		)
+			throw new MailAuthError();
+		throw new ApiError(502, 'Could not reach mail authorization — try again shortly');
+	}
 	const result = await response.json();
 	assert(
 		typeof result.access_token === 'string' &&

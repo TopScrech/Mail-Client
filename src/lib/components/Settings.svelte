@@ -15,6 +15,7 @@
 		onremovepasskey,
 		onrevoke,
 		ondisconnect,
+		onreconnect,
 		onrename,
 		onlogout,
 		onconnect
@@ -31,6 +32,7 @@
 		onremovepasskey: (id: string) => void;
 		onrevoke: (id: string) => void;
 		ondisconnect: (id: string) => void;
+		onreconnect: (account: MailAccount) => void;
 		onrename: (id: string, name: string) => Promise<boolean>;
 		onlogout: () => void;
 		onconnect: () => void;
@@ -112,6 +114,11 @@
 									: 'Not synced yet')}</small
 						>
 					</div>
+					{#if account.reconnectRequired}<button
+							class="text-button accent"
+							disabled={busy || demo}
+							onclick={() => onreconnect(account)}>Reconnect</button
+						>{/if}
 					<button
 						class="text-button"
 						disabled={busy}

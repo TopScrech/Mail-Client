@@ -8,6 +8,7 @@ export interface MailAccount {
 	smtpPort: number;
 	lastSync: string | null;
 	error: string | null;
+	reconnectRequired?: boolean;
 }
 export interface Attachment {
 	index: number;

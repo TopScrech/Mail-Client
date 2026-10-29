@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { beforeEach, describe, expect, test, spyOn } from 'bun:test';
 import type { RequestEvent } from '@sveltejs/kit';
 process.env.DATABASE_PATH = ':memory:';
 process.env.ENCRYPTION_KEY = Buffer.alloc(32, 9).toString('base64');
@@ -363,4 +363,218 @@ test('OAuth renewal rotates refresh tokens and reports revoked access safely', a
 	} finally {
 		globalThis.fetch = originalFetch;
 	}
+});
+
+describe('Mail account reconnection', () => {
+	const input = {
+		name: 'Changed label',
+		email: 'alice@example.com',
+		password: 'new-password',
+		imapHost: 'imap.mail.me.com',
+		smtpHost: 'smtp.mail.me.com',
+		smtpPort: 587
+	};
+	function prepare(oauth = false, reconnectRequired = true) {
+		const data = {
+			...snapshot('alice').accounts[0],
+			...input,
+			name: 'Personal',
+			error: reconnectRequired ? 'Authentication failed' : null,
+			reconnectRequired
+		};
+		delete (data as Record<string, unknown>).password;
+		db.query('UPDATE accounts SET data=?, secret=? WHERE id=?').run(
+			JSON.stringify(data),
+			encrypt(
+				JSON.stringify(
+					oauth
+						? {
+								username: 'alice@example.com',
+								oauth: {
+									provider: 'google',
+									accessToken: 'expired',
+									refreshToken: 'revoked',
+									expiresAt: 0
+								}
+							}
+						: { username: 'custom-login', password: 'old-password' }
+				),
+				'alice:account-alice'
+			),
+			'account-alice'
+		);
+	}
+	test('rejected OAuth refresh marks the account for reconnect and preserves cached mail', async () => {
+		prepare(true, false);
+		const originalFetch = globalThis.fetch;
+		const revision = snapshot('alice').revision;
+		try {
+			globalThis.fetch = (async () =>
+				Response.json({ error: 'invalid_grant' }, { status: 400 })) as typeof fetch;
+			const result = await POST(event('mail/sync', 'POST', {}));
+			const body = await result.json();
+			expect(body.accounts[0].reconnectRequired).toBe(true);
+			expect(body.accounts[0].error).toContain('reconnect');
+			expect(body.revision).toBeGreaterThan(revision);
+			expect(body.errors[0]).toContain('connect the account again');
+			expect(snapshot('bob').accounts[0].reconnectRequired).toBeUndefined();
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+	test('provider outages do not request new credentials', async () => {
+		prepare(true);
+		const data = snapshot('alice').accounts[0];
+		data.reconnectRequired = false;
+		data.error = null;
+		db.query('UPDATE accounts SET data=? WHERE id=?').run(JSON.stringify(data), data.id);
+		const originalFetch = globalThis.fetch;
+		try {
+			globalThis.fetch = (async () =>
+				Response.json({ error: 'server_error' }, { status: 503 })) as typeof fetch;
+			const result = await POST(event('mail/sync', 'POST', {}));
+			const body = await result.json();
+			expect(body.accounts[0].reconnectRequired).toBe(false);
+			expect(body.errors[0]).toContain('try again shortly');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+	test('IMAP login rejection produces a persistent reconnect suggestion', async () => {
+		prepare(false, false);
+		const { ImapFlow } = await import('imapflow');
+		const login = spyOn(ImapFlow.prototype, 'connect').mockRejectedValue(
+			Object.assign(new Error('Invalid login'), { authenticationFailed: true })
+		);
+		const logout = spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined);
+		try {
+			const result = await POST(event('mail/sync', 'POST', {}));
+			const body = await result.json();
+			expect(body.accounts[0].reconnectRequired).toBe(true);
+			expect(body.accounts[0].error).toContain('reconnect');
+		} finally {
+			login.mockRestore();
+			logout.mockRestore();
+		}
+	});
+	test('reconnecting replaces verified credentials in place and keeps messages and drafts', async () => {
+		prepare();
+		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
+			'cached',
+			'alice',
+			'account-alice',
+			JSON.stringify({ id: 'cached', accountId: 'account-alice' })
+		);
+		db.query('INSERT INTO drafts VALUES (?,?,?)').run(
+			'saved',
+			'alice',
+			JSON.stringify({ id: 'saved', accountId: 'account-alice' })
+		);
+		const { ImapFlow } = await import('imapflow');
+		const { default: nodemailer } = await import('nodemailer');
+		const login = spyOn(ImapFlow.prototype, 'connect').mockResolvedValue(undefined);
+		const logout = spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined);
+		const transport = spyOn(nodemailer, 'createTransport').mockReturnValue({
+			verify: async () => true,
+			close() {}
+		} as never);
+		try {
+			const result = await POST(event('accounts/account-alice/reconnect', 'POST', input));
+			expect(result.status).toBe(200);
+			const after = snapshot('alice');
+			expect(after.accounts).toHaveLength(1);
+			expect(after.accounts[0].id).toBe('account-alice');
+			expect(after.accounts[0].name).toBe('Personal');
+			expect(after.accounts[0].reconnectRequired).toBe(false);
+			expect(after.accounts[0].error).toBeNull();
+			expect(after.messages[0].id).toBe('cached');
+			expect(after.drafts[0].id).toBe('saved');
+			const row = one<{ secret: string }>(
+				'SELECT secret FROM accounts WHERE id=?',
+				'account-alice'
+			)!;
+			expect(JSON.parse(decrypt(row.secret, 'alice:account-alice'))).toEqual({
+				username: 'custom-login',
+				password: 'new-password'
+			});
+		} finally {
+			login.mockRestore();
+			logout.mockRestore();
+			transport.mockRestore();
+		}
+	});
+	test('SMTP authentication rejection suggests reconnect and allows a safe send retry', async () => {
+		prepare(false, false);
+		const { default: nodemailer } = await import('nodemailer');
+		const transport = spyOn(nodemailer, 'createTransport').mockReturnValue({
+			sendMail: async () => {
+				throw Object.assign(new Error('Login denied'), { code: 'EAUTH' });
+			},
+			close() {}
+		} as never);
+		try {
+			const { send } = await import('../src/lib/server/mail');
+			await expect(
+				send(
+					'alice',
+					{
+						id: 'draft',
+						accountId: 'account-alice',
+						to: 'friend@example.com',
+						subject: 'Hello',
+						text: 'Message',
+						updatedAt: ''
+					},
+					[],
+					'rejected-auth-send'
+				)
+			).rejects.toThrow('connect the account again');
+			expect(snapshot('alice').accounts[0].reconnectRequired).toBe(true);
+			expect(one('SELECT id FROM sends WHERE id=?', 'rejected-auth-send')).toBeNull();
+		} finally {
+			transport.mockRestore();
+		}
+	});
+	test('failed reconnect leaves previous credentials and error state intact', async () => {
+		prepare();
+		const before = one<{ secret: string }>(
+			'SELECT secret FROM accounts WHERE id=?',
+			'account-alice'
+		)!;
+		const { ImapFlow } = await import('imapflow');
+		const { default: nodemailer } = await import('nodemailer');
+		const login = spyOn(ImapFlow.prototype, 'connect').mockRejectedValue(
+			Object.assign(new Error('Invalid login'), { authenticationFailed: true })
+		);
+		const logout = spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined);
+		const transport = spyOn(nodemailer, 'createTransport').mockReturnValue({ close() {} } as never);
+		try {
+			expect((await POST(event('accounts/account-alice/reconnect', 'POST', input))).status).toBe(
+				422
+			);
+			expect(snapshot('alice').accounts[0].reconnectRequired).toBe(true);
+			expect(
+				one<{ secret: string }>('SELECT secret FROM accounts WHERE id=?', 'account-alice')!.secret
+			).toBe(before.secret);
+		} finally {
+			login.mockRestore();
+			logout.mockRestore();
+			transport.mockRestore();
+		}
+	});
+	test('reconnect rejects other owners and changing the account identity', async () => {
+		prepare();
+		expect((await POST(event('accounts/account-bob/reconnect', 'POST', input))).status).toBe(404);
+		expect(
+			(
+				await POST(
+					event('accounts/account-alice/reconnect', 'POST', {
+						...input,
+						email: 'other@example.com'
+					})
+				)
+			).status
+		).toBe(400);
+		expect(snapshot('alice').accounts[0].reconnectRequired).toBe(true);
+	});
 });

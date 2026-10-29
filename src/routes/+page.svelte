@@ -3,7 +3,7 @@
 	import { startAuthentication, startRegistration } from '@simplewebauthn/browser';
 	import { api, RequestError } from '$lib/api';
 	import { demoSnapshot } from '$lib/demo';
-	import type { Snapshot, Profile, Folder, Message, Draft } from '$lib/types';
+	import type { Snapshot, Profile, Folder, Message, Draft, MailAccount } from '$lib/types';
 	import SignIn from '$lib/components/SignIn.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import MessageList from '$lib/components/MessageList.svelte';
@@ -31,6 +31,8 @@
 	let mailOAuth = $state({ google: false, microsoft: false });
 	let toast = $state('');
 	let connect = $state(false);
+	let reconnectingAccount = $state<MailAccount | null>(null);
+	let reconnectAccounts = $derived(mailbox.accounts.filter((account) => account.reconnectRequired));
 	let settings = $state(false);
 	let composer = $state<Draft | null>(null);
 	let mobileReading = $state(false);
@@ -247,6 +249,7 @@
 	function compose(reply = false) {
 		error = '';
 		if (!mailbox.accounts.length) {
+			reconnectingAccount = null;
 			connect = true;
 			return;
 		}
@@ -312,12 +315,29 @@
 			await pull();
 		});
 	}
+	function reconnectAccount(account: MailAccount) {
+		reconnectingAccount = account;
+		settings = false;
+		error = '';
+		connect = true;
+	}
 	async function connectAccount(data: Record<string, unknown>) {
 		await action(async () => {
-			await api('accounts', 'POST', data);
+			await api(
+				reconnectingAccount
+					? `accounts/${encodeURIComponent(reconnectingAccount.id)}/reconnect`
+					: 'accounts',
+				'POST',
+				data
+			);
 			connect = false;
 			await pull();
-			notice('Account connected — fetching your mail');
+			notice(
+				reconnectingAccount
+					? 'Account reconnected — fetching your mail'
+					: 'Account connected — fetching your mail'
+			);
+			reconnectingAccount = null;
 			void syncMail();
 		});
 	}
@@ -378,6 +398,7 @@
 				if (!profile && new URL(location.href).searchParams.get('demo') === '1') preview();
 				const params = new URL(location.href).searchParams;
 				if (params.has('mailError')) {
+					reconnectingAccount = null;
 					connect = true;
 					error = params.get('mailError') || 'Mail connection failed';
 					history.replaceState(null, '', '/');
@@ -445,6 +466,7 @@
 				oncompose={() => compose()}
 				onconnect={() => {
 					if (requireReal()) {
+						reconnectingAccount = null;
 						connect = true;
 						error = '';
 					}
@@ -479,7 +501,16 @@
 				onchange={changeMessage}
 			/>
 		</div>
-		{#if syncWarning}<div class="sync-warning" role="status">
+		{#each reconnectAccounts as account (account.id)}
+			<div class="sync-warning" role="alert">
+				<Icon name="key" size={16} />
+				<span
+					>Authentication failed for {account.email} — reconnect this account to resume mail</span
+				>
+				<button disabled={busy} onclick={() => reconnectAccount(account)}>Reconnect account</button>
+			</div>
+		{/each}
+		{#if syncWarning && !reconnectAccounts.length}<div class="sync-warning" role="status">
 				<Icon name="cloud" size={16} />{syncWarning}<button onclick={syncMail} disabled={syncing}
 					>Try again</button
 				>
@@ -489,6 +520,7 @@
 				><button
 					class="primary"
 					onclick={() => {
+						reconnectingAccount = null;
 						connect = true;
 						error = '';
 					}}>Connect account</button
@@ -496,6 +528,7 @@
 			</div>{/if}
 	</div>{/if}
 {#if connect}<ConnectAccount
+		account={reconnectingAccount}
 		{demo}
 		{mailOAuth}
 		{busy}
@@ -538,6 +571,7 @@
 		}}
 		onremovepasskey={(id) => remove(`passkeys/${encodeURIComponent(id)}`)}
 		onrevoke={(id) => remove(`sessions/${id}`)}
+		onreconnect={reconnectAccount}
 		ondisconnect={(id) => remove(`accounts/${id}`)}
 		onrename={async (id, name) => {
 			if (busy) return false;
@@ -563,6 +597,7 @@
 		onconnect={() => {
 			if (requireReal()) {
 				settings = false;
+				reconnectingAccount = null;
 				connect = true;
 				error = '';
 			}

@@ -124,6 +124,13 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		const input = await body(event);
 		return json(await serialized(uid, () => connectAccount(uid, input)), { status: 201 });
 	}
+	if (/^accounts\/[^/]+\/reconnect$/.test(path) && method === 'POST') {
+		limit(`connect:${uid}`, 10, 3600_000);
+		const input = await body(event);
+		return json(
+			await serialized(uid, () => connectAccount(uid, input, undefined, path.split('/')[1]))
+		);
+	}
 	if (path.startsWith('accounts/') && method === 'PATCH') {
 		const { name } = await body(event);
 		assert(

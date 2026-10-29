@@ -7,6 +7,7 @@ import { db, one, all, bump } from './db';
 import { encrypt, decrypt } from './crypto';
 import { allowedHosts, assert, string, ApiError } from './config';
 import { refreshOAuth, type Credentials } from './mail-oauth';
+import { isMailAuthError, MailAuthError } from './mail-errors';
 import type { MailAccount, Message, Folder, Draft } from '$lib/types';
 interface AccountRow {
 	id: string;
@@ -35,17 +36,52 @@ export function account(userId: string, id: string) {
 		credentials: JSON.parse(decrypt(row.secret, `${userId}:${id}`)) as Credentials
 	};
 }
-async function authorizedAccount(userId: string, id: string) {
-	const result = account(userId, id);
-	if (result.credentials.oauth) {
-		result.credentials.oauth = await refreshOAuth(result.credentials.oauth);
-		db.query('UPDATE accounts SET secret=? WHERE id=? AND user_id=?').run(
-			encrypt(JSON.stringify(result.credentials), `${userId}:${id}`),
+function recordAuthFailure(userId: string, id: string, error: unknown) {
+	if (!isMailAuthError(error)) return;
+	const row = one<{ data: string }>(
+		'SELECT data FROM accounts WHERE id=? AND user_id=?',
+		id,
+		userId
+	);
+	if (!row) return;
+	const data: MailAccount = JSON.parse(row.data);
+	data.reconnectRequired = true;
+	data.error =
+		'Authentication failed — reconnect this account to continue receiving and sending mail';
+	db.transaction(() => {
+		db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
+			JSON.stringify(data),
 			id,
 			userId
 		);
+		bump(userId);
+	})();
+}
+async function authorizedAccount(userId: string, id: string) {
+	const result = account(userId, id);
+	try {
+		if (result.credentials.oauth) {
+			result.credentials.oauth = await refreshOAuth(result.credentials.oauth);
+			db.query('UPDATE accounts SET secret=? WHERE id=? AND user_id=?').run(
+				encrypt(JSON.stringify(result.credentials), `${userId}:${id}`),
+				id,
+				userId
+			);
+		}
+	} catch (error) {
+		recordAuthFailure(userId, id, error);
+		throw error;
 	}
 	return result;
+}
+async function connectImap(client: ImapFlow, userId: string, id: string) {
+	try {
+		await client.connect();
+	} catch (error) {
+		recordAuthFailure(userId, id, error);
+		if (isMailAuthError(error)) throw new MailAuthError();
+		throw error;
+	}
 }
 function validateHost(host: string) {
 	assert(
@@ -92,16 +128,25 @@ function smtp(data: MailAccount, credentials: Credentials) {
 export async function connectAccount(
 	userId: string,
 	input: Record<string, unknown>,
-	oauthCredentials?: Credentials
+	oauthCredentials?: Credentials,
+	reconnectId?: string
 ) {
-	const existing = oauthCredentials
-		? all<{ id: string; data: string }>(
-				'SELECT id,data FROM accounts WHERE user_id=?',
-				userId
-			).find(
-				(row) => JSON.parse(row.data).email.toLowerCase() === String(input.email).toLowerCase()
-			)
-		: undefined;
+	const existing = reconnectId
+		? account(userId, reconnectId).row
+		: oauthCredentials
+			? all<{ id: string; data: string }>(
+					'SELECT id,data FROM accounts WHERE user_id=?',
+					userId
+				).find(
+					(row) => JSON.parse(row.data).email.toLowerCase() === String(input.email).toLowerCase()
+				)
+			: undefined;
+	if (reconnectId) {
+		assert(
+			JSON.parse(existing!.data).email.toLowerCase() === String(input.email).toLowerCase(),
+			'Reconnect using the same email address'
+		);
+	}
 	const data: MailAccount = {
 		id: existing?.id || crypto.randomUUID(),
 		email: string(input.email, 'email address'),
@@ -110,7 +155,8 @@ export async function connectAccount(
 		smtpHost: string(input.smtpHost, 'SMTP host').toLowerCase(),
 		smtpPort: Number(input.smtpPort),
 		lastSync: null,
-		error: null
+		error: null,
+		reconnectRequired: false
 	};
 	assert(/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(data.email), 'Enter a valid email address');
 	assert([465, 587].includes(data.smtpPort), 'Use SMTP port 465 or 587');
@@ -121,7 +167,11 @@ export async function connectAccount(
 	validateHost(data.imapHost);
 	validateHost(data.smtpHost);
 	const credentials: Credentials = oauthCredentials || {
-		username: string(input.username || input.email, 'username'),
+		username: string(
+			input.username ||
+				(reconnectId ? account(userId, reconnectId).credentials.username : input.email),
+			'username'
+		),
 		password:
 			typeof input.password === 'string' &&
 			input.password.length > 0 &&
@@ -175,7 +225,7 @@ export async function syncAccount(userId: string, id: string) {
 	const client = imap(data, credentials);
 	const messages: Message[] = [];
 	try {
-		await client.connect();
+		await connectImap(client, userId, data.id);
 		const folders = (await client.list()).filter(
 			(x) => x.path.toUpperCase() === 'INBOX' || special[x.specialUse || '']
 		);
@@ -243,7 +293,7 @@ export async function syncAccount(userId: string, id: string) {
 			}
 		}
 		data.lastSync = now();
-		data.error = null;
+		if (!data.reconnectRequired) data.error = null;
 		db.transaction(() => {
 			db.query('DELETE FROM messages WHERE account_id=? AND user_id=?').run(id, userId);
 			const insert = db.query('INSERT INTO messages VALUES (?,?,?,?)');
@@ -255,7 +305,8 @@ export async function syncAccount(userId: string, id: string) {
 			);
 			bump(userId);
 		})();
-	} catch {
+	} catch (error) {
+		if (isMailAuthError(error)) throw new MailAuthError();
 		data.error = 'Could not sync this account — check your connection or reconnect the account';
 		db.transaction(() => {
 			db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
@@ -288,7 +339,7 @@ export async function updateMessage(
 	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
 	const client = imap(data, credentials);
 	try {
-		await client.connect();
+		await connectImap(client, userId, data.id);
 		const target = change.folder ? await destination(client, change.folder) : null;
 		const lock = await client.getMailboxLock(mail.path);
 		try {
@@ -332,7 +383,7 @@ export async function attachment(userId: string, id: string, index: number) {
 	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
 	const client = imap(data, credentials);
 	try {
-		await client.connect();
+		await connectImap(client, userId, data.id);
 		const lock = await client.getMailboxLock(mail.path);
 		try {
 			assert(
@@ -415,7 +466,7 @@ export async function send(
 		if (data.smtpHost !== 'smtp.gmail.com' && process.env.SMTP_SAVES_SENT !== 'true') {
 			const client = imap(data, credentials);
 			try {
-				await client.connect();
+				await connectImap(client, userId, data.id);
 				const path = await destination(client, 'sent');
 				await client.append(path, raw, ['\\Seen']);
 			} catch {
@@ -431,6 +482,15 @@ export async function send(
 				: sentCopyWarning
 		};
 	} catch (error) {
+		if (isMailAuthError(error)) {
+			recordAuthFailure(userId, data.id, error);
+			db.query('DELETE FROM sends WHERE id=? AND user_id=? AND state=?').run(
+				requestId,
+				userId,
+				'pending'
+			);
+			throw new MailAuthError();
+		}
 		if (error instanceof ApiError) throw error;
 		throw new ApiError(502, 'Delivery could not be confirmed — check Sent before trying again');
 	} finally {

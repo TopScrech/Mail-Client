@@ -34,6 +34,7 @@ Registration never creates a user — Apple signup must happen first
 | ------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | GET    | `/sync?since=<revision>`               | Returns `Snapshot`, or HTTP 204 when the revision matches                                                                 |
 | POST   | `/accounts`                            | `{ name, email, username?, password, imapHost, smtpHost, smtpPort }` — validates IMAP and SMTP before storing credentials |
+| POST   | `/accounts/:id/reconnect` | Same body as `/accounts` with the existing email — verifies credentials and keeps the account ID, cached messages, and drafts |
 | DELETE | `/accounts/:id`                        | Disconnects from all devices and removes cached mail and associated drafts — provider mail is untouched                   |
 | POST   | `/mail/sync`                           | `{ accountId? }` — synchronizes one or all owned accounts and returns the snapshot plus an `errors` array                 |
 | PATCH  | `/messages`                            | `{ id, read?, starred?, folder? }` — destination folder is `inbox`, `archive`, or `trash`                                 |
@@ -44,7 +45,11 @@ Registration never creates a user — Apple signup must happen first
 
 `Snapshot` contains `revision`, `accounts`, `messages`, and `drafts` — the canonical TypeScript wire shapes are in `src/lib/types.ts`
 
-Account responses never include passwords — passwords can only be supplied through the connect endpoint
+Account responses never include passwords — passwords can only be supplied through the connect and reconnect endpoints
+
+Accounts with rejected mail credentials report `reconnectRequired: true` and a reconnect suggestion in `error` — reconnect with the same provider and email to restore access
+
+For Google and Microsoft accounts, repeat the mail OAuth flow with the same email to replace authorization while keeping the existing account and cached mail
 
 Message identifiers include the account, folder path, UIDVALIDITY, and UID — treat them as opaque strings and URI-encode them where needed
 
