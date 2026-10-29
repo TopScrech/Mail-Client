@@ -231,6 +231,99 @@ async function destination(client: ImapFlow, folder: Folder) {
 	assert(entry, `Your mail server does not expose a ${folder} folder`, 422);
 	return entry.path;
 }
+// Publish metadata before downloading bodies so large messages cannot delay inbox visibility
+async function syncFolder(
+	userId: string,
+	id: string,
+	client: ImapFlow,
+	path: string,
+	folder: Folder
+) {
+	const lock = await client.getMailboxLock(path);
+	try {
+		const messages: Message[] = [];
+		const mailbox = client.mailbox;
+		assert(mailbox, 'Mailbox is not open', 502);
+		const headers = mailbox.exists
+			? await client.fetchAll(`${Math.max(1, mailbox.exists - 49)}:*`, {
+					uid: true,
+					flags: true,
+					envelope: true,
+					internalDate: true,
+					size: true
+				})
+			: [];
+		for (const header of headers) {
+			if (!header.envelope) continue;
+			const envelope = header.envelope;
+			const uidValidity = mailbox.uidValidity.toString();
+			const messageId = `${id}:${encodeURIComponent(path)}:${uidValidity}:${header.uid}`;
+			const existing = one<{ data: string }>(
+				'SELECT data FROM messages WHERE id=? AND user_id=?',
+				messageId,
+				userId
+			);
+			const cached: Message | undefined = existing ? JSON.parse(existing.data) : undefined;
+			messages.push({
+				id: messageId,
+				accountId: id,
+				folder,
+				path,
+				uid: header.uid,
+				uidValidity,
+				from: envelope.from?.[0]?.name || envelope.from?.[0]?.address || 'Unknown sender',
+				fromAddress: envelope.from?.[0]?.address || '',
+				to: envelope.to?.map((x) => x.address).join(', ') || '',
+				subject: envelope.subject || '(No subject)',
+				text: cached?.text || '',
+				html: cached?.html,
+				date: envelope.date ? new Date(envelope.date).toISOString() : now(),
+				read: header.flags?.has('\\Seen') || false,
+				starred: header.flags?.has('\\Flagged') || false,
+				messageId: envelope.messageId || '',
+				attachments: cached?.attachments || []
+			});
+		}
+		db.transaction(() => {
+			db.query(
+				folder === 'inbox'
+					? "DELETE FROM messages WHERE account_id=? AND user_id=? AND json_extract(data,'$.folder')=?"
+					: "DELETE FROM messages WHERE account_id=? AND user_id=? AND json_extract(data,'$.path')=?"
+			).run(id, userId, folder === 'inbox' ? 'inbox' : path);
+			const insert = db.query('INSERT INTO messages VALUES (?,?,?,?)');
+			for (const message of messages) insert.run(message.id, userId, id, JSON.stringify(message));
+			bump(userId);
+		})();
+		for (const message of messages) {
+			if (message.html !== undefined) continue;
+			const header = headers.find((header) => header.uid === message.uid)!;
+			if ((header.size || 0) > 20 * 1024 * 1024) {
+				message.text = 'This message is larger than 20 MB — open it in your provider’s client';
+				message.html = null;
+			} else {
+				const source = await client.fetchOne(message.uid, { source: true }, { uid: true });
+				if (!source || !source.source) continue;
+				Object.assign(message, await parseMessageBody(source.source));
+			}
+			db.transaction(() => {
+				db.query('UPDATE messages SET data=? WHERE id=? AND user_id=?').run(
+					JSON.stringify(message),
+					message.id,
+					userId
+				);
+				bump(userId);
+			})();
+		}
+		return messages;
+	} finally {
+		lock.release();
+	}
+}
+
+export async function syncInbox(userId: string, id: string, client: ImapFlow) {
+	await syncFolder(userId, id, client, 'INBOX', 'inbox');
+}
+
 export async function syncAccount(userId: string, id: string) {
 	const { data, credentials } = await authorizedAccount(userId, id);
 	const client = imap(data, credentials);
@@ -240,68 +333,20 @@ export async function syncAccount(userId: string, id: string) {
 		const folders = (await client.list()).filter(
 			(x) => x.path.toUpperCase() === 'INBOX' || special[x.specialUse || '']
 		);
+		// Publish the inbox before slower folders during reconciliation as well
+		folders.sort(
+			(a, b) => Number(b.path.toUpperCase() === 'INBOX') - Number(a.path.toUpperCase() === 'INBOX')
+		);
 		for (const folder of folders) {
-			const lock = await client.getMailboxLock(folder.path);
-			try {
-				const mailbox = client.mailbox;
-				if (!mailbox || !mailbox.exists) continue;
-				const first = Math.max(1, mailbox.exists - 49);
-				const headers = await client.fetchAll(`${first}:*`, {
-					uid: true,
-					flags: true,
-					envelope: true,
-					internalDate: true,
-					size: true
-				});
-				for (const header of headers) {
-					if (!header.envelope) continue;
-					const envelope = header.envelope;
-					const uidValidity = mailbox.uidValidity.toString();
-					const messageId = `${id}:${encodeURIComponent(folder.path)}:${uidValidity}:${header.uid}`;
-					const existing = one<{ data: string }>(
-						'SELECT data FROM messages WHERE id=? AND user_id=?',
-						messageId,
-						userId
-					);
-					const cached: Message | undefined = existing ? JSON.parse(existing.data) : undefined;
-					let text = cached?.text || '';
-					let html = cached?.html;
-					let attachments: Message['attachments'] = cached?.attachments || [];
-					// Undefined marks messages cached before HTML support and retries failed body fetches
-					if (html === undefined) {
-						if ((header.size || 0) <= 20 * 1024 * 1024) {
-							const source = await client.fetchOne(header.uid, { source: true }, { uid: true });
-							if (source && source.source) {
-								({ text, html, attachments } = await parseMessageBody(source.source));
-							}
-						} else {
-							text = 'This message is larger than 20 MB — open it in your provider’s client';
-							html = null;
-						}
-					}
-					messages.push({
-						id: messageId,
-						accountId: id,
-						folder: folder.path.toUpperCase() === 'INBOX' ? 'inbox' : special[folder.specialUse!],
-						path: folder.path,
-						uid: header.uid,
-						uidValidity,
-						from: envelope.from?.[0]?.name || envelope.from?.[0]?.address || 'Unknown sender',
-						fromAddress: envelope.from?.[0]?.address || '',
-						to: envelope.to?.map((x) => x.address).join(', ') || '',
-						subject: envelope.subject || '(No subject)',
-						text,
-						html,
-						date: envelope.date ? new Date(envelope.date).toISOString() : now(),
-						read: header.flags?.has('\\Seen') || false,
-						starred: header.flags?.has('\\Flagged') || false,
-						messageId: envelope.messageId || '',
-						attachments
-					});
-				}
-			} finally {
-				lock.release();
-			}
+			messages.push(
+				...(await syncFolder(
+					userId,
+					id,
+					client,
+					folder.path,
+					folder.path.toUpperCase() === 'INBOX' ? 'inbox' : special[folder.specialUse!]
+				))
+			);
 		}
 		data.lastSync = now();
 		if (!data.reconnectRequired) data.error = null;

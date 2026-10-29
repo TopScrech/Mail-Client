@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
-import { MailWorker, type WatchedAccount } from '../src/lib/server/mail-worker';
+import { MailWorker, type SyncRequest, type WatchedAccount } from '../src/lib/server/mail-worker';
 
 class FakeClient extends EventEmitter {
 	closed = false;
@@ -30,7 +30,12 @@ afterEach(() => {
 	for (const worker of workers.splice(0)) worker.stop();
 });
 
-function setup(sync: (account: WatchedAccount) => Promise<void> = async () => {}) {
+function setup(
+	sync: (
+		account: WatchedAccount,
+		request: SyncRequest<FakeClient>
+	) => Promise<void> = async () => {}
+) {
 	const accounts: WatchedAccount[] = [{ id: 'a', userId: 'alice', version: 'credentials-1' }];
 	const clients: FakeClient[] = [];
 	let syncs = 0;
@@ -42,9 +47,9 @@ function setup(sync: (account: WatchedAccount) => Promise<void> = async () => {}
 				clients.push(client);
 				return client;
 			},
-			async sync(account) {
+			async sync(account, request) {
 				syncs++;
-				await sync(account);
+				await sync(account, request);
 			},
 			failed() {}
 		},
@@ -55,6 +60,21 @@ function setup(sync: (account: WatchedAccount) => Promise<void> = async () => {}
 }
 
 describe('Background mail synchronization', () => {
+	test('uses the selected connection for notifications and reserves full scans for reconciliation', async () => {
+		const requests: SyncRequest<FakeClient>[] = [];
+		const state = setup(async (_, request) => {
+			requests.push(request);
+		});
+		state.worker.start();
+		await until(() => requests.length === 1);
+		expect(requests[0].reconcile).toBe(true);
+		state.clients[0].emit('exists');
+		await until(() => requests.length === 2);
+		expect(requests[1]).toEqual({ client: state.clients[0], reconcile: false });
+		state.clients[0].close();
+		await until(() => requests.length === 3);
+		expect(requests[2].reconcile).toBe(true);
+	});
 	test('selects INBOX, syncs without a browser, and coalesces notification bursts', async () => {
 		const state = setup();
 		state.worker.start();
@@ -140,7 +160,7 @@ describe('Background mail synchronization', () => {
 		const worker = new MailWorker({
 			accounts: () => [{ id: 'a', userId: 'alice', version: '1' }],
 			client: () =>
-				new Promise((resolve) => {
+				new Promise<FakeClient>((resolve) => {
 					release = resolve;
 				}),
 			sync: async () => {},

@@ -6,7 +6,8 @@ import {
 	processPendingMoves,
 	recordAuthFailure,
 	serialized,
-	syncAccount
+	syncAccount,
+	syncInbox
 } from './mail';
 
 export function startMailWorker() {
@@ -24,8 +25,8 @@ export function startMailWorker() {
 				}));
 		},
 		client: (account) => idleClient(account.userId, account.id),
-		async sync(account) {
-			await processPendingMoves(account.userId);
+		async sync(account, request) {
+			if (request.reconcile) await processPendingMoves(account.userId);
 			await serialized(account.userId, async () => {
 				// A queued job may outlive a disconnect or credential replacement
 				const current = all<{ secret: string; data: string }>(
@@ -39,7 +40,11 @@ export function startMailWorker() {
 					JSON.parse(current.data).reconnectRequired
 				)
 					return;
-				await syncAccount(account.userId, account.id);
+				if (!request.reconcile && request.client) {
+					await syncInbox(account.userId, account.id, request.client);
+				} else {
+					await syncAccount(account.userId, account.id);
+				}
 			});
 		},
 		failed: (account, error) => recordAuthFailure(account.userId, account.id, error)

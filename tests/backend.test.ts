@@ -823,3 +823,164 @@ describe('Message move reconciliation', () => {
 		}
 	});
 });
+
+describe('Inbox notification latency', () => {
+	test('reconciliation publishes the inbox before waiting for slower folders', async () => {
+		const { syncAccount } = await import('../src/lib/server/mail');
+		const { ImapFlow } = await import('imapflow');
+		const data = { ...snapshot('alice').accounts[0], imapHost: 'imap.mail.me.com' };
+		db.query('UPDATE accounts SET data=?,secret=? WHERE id=?').run(
+			JSON.stringify(data),
+			encrypt(JSON.stringify({ username: data.email, password: 'test' }), 'alice:account-alice'),
+			data.id
+		);
+		let release!: () => void;
+		const opened: string[] = [];
+		const mocks = [
+			spyOn(ImapFlow.prototype, 'connect').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'list').mockResolvedValue([
+				{ path: 'Sent', specialUse: '\\Sent' },
+				{ path: 'INBOX' }
+			] as never),
+			spyOn(ImapFlow.prototype, 'getMailboxLock').mockImplementation(async function (
+				this: InstanceType<typeof ImapFlow>,
+				path: string | string[]
+			) {
+				opened.push(String(path));
+				if (path === 'Sent')
+					await new Promise<void>((resolve) => {
+						release = resolve;
+					});
+				this.mailbox = { exists: path === 'INBOX' ? 1 : 0, uidValidity: 1n } as never;
+				return { release() {} } as never;
+			}),
+			spyOn(ImapFlow.prototype, 'fetchAll').mockResolvedValue([
+				{ uid: 7, flags: new Set(), size: 50, envelope: { subject: 'Published first' } }
+			] as never),
+			spyOn(ImapFlow.prototype, 'fetchOne').mockResolvedValue({
+				source: Buffer.from('Content-Type: text/plain\r\n\r\nBody')
+			} as never)
+		];
+		const job = syncAccount('alice', data.id);
+		try {
+			for (let attempt = 0; !release && attempt < 100; attempt++) await Bun.sleep(2);
+			expect(release).toBeDefined();
+			expect(opened).toEqual(['INBOX', 'Sent']);
+			expect(snapshot('alice').messages[0].subject).toBe('Published first');
+		} finally {
+			release?.();
+			await job;
+			mocks.forEach((mock) => mock.mockRestore());
+		}
+	});
+
+	async function fixture() {
+		const { syncInbox } = await import('../src/lib/server/mail');
+		const { ImapFlow } = await import('imapflow');
+		const client = new ImapFlow({ host: 'unused.example', logger: false });
+		client.mailbox = { exists: 1, uidValidity: 1n } as never;
+		const headers = [
+			{
+				uid: 7,
+				size: 120,
+				flags: new Set<string>(),
+				envelope: {
+					from: [{ name: 'Friend', address: 'friend@example.com' }],
+					to: [{ address: 'alice@example.com' }],
+					subject: 'Arrived now',
+					date: new Date('2026-10-29T10:00:00Z')
+				}
+			}
+		];
+		const mocks = [
+			spyOn(client, 'connect').mockImplementation(async () => {
+				throw new Error('Must reuse IDLE connection');
+			}),
+			spyOn(client, 'list').mockImplementation(async () => {
+				throw new Error('Must not scan other folders');
+			}),
+			spyOn(client, 'logout').mockImplementation(async () => {
+				throw new Error('Must keep IDLE connection');
+			}),
+			spyOn(client, 'getMailboxLock').mockResolvedValue({ release() {} } as never),
+			spyOn(client, 'fetchAll').mockImplementation(async () => headers as never)
+		];
+		return {
+			client,
+			headers,
+			syncInbox,
+			restore: () => mocks.forEach((mock) => mock.mockRestore())
+		};
+	}
+
+	test('publishes the inbox over SSE before a slow body download completes, preserving other folders', async () => {
+		const state = await fixture();
+		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
+			'sent-copy',
+			'alice',
+			'account-alice',
+			JSON.stringify({ id: 'sent-copy', folder: 'sent', path: 'Sent', accountId: 'account-alice' })
+		);
+		let download!: (result: never) => void;
+		const source = spyOn(state.client, 'fetchOne').mockImplementation(
+			() =>
+				new Promise<never>((resolve) => {
+					download = resolve;
+				})
+		);
+		const reader = (await GET(event('events'))).body!.getReader();
+		await reader.read();
+		const notification = reader.read();
+		const job = state.syncInbox('alice', 'account-alice', state.client);
+		try {
+			const update = new TextDecoder().decode((await notification).value);
+			expect(update).toContain('event: revision');
+			const inbox = snapshot('alice').messages.find((message) => message.folder === 'inbox')!;
+			expect(inbox.subject).toBe('Arrived now');
+			expect(inbox.html).toBeUndefined();
+			expect(snapshot('alice').messages.some((message) => message.id === 'sent-copy')).toBe(true);
+			expect(state.client.connect).not.toHaveBeenCalled();
+			expect(state.client.list).not.toHaveBeenCalled();
+			const revision = snapshot('alice').revision;
+			// The UI already has the message while the download remains blocked
+			expect(download).toBeDefined();
+			download({
+				source: Buffer.from(
+					'From: friend@example.com\r\nContent-Type: text/plain\r\n\r\nDownloaded body'
+				)
+			} as never);
+			await job;
+			expect(snapshot('alice').messages.find((message) => message.id === inbox.id)?.text).toContain(
+				'Downloaded body'
+			);
+			expect(snapshot('alice').revision).toBeGreaterThan(revision);
+			expect(state.client.logout).not.toHaveBeenCalled();
+		} finally {
+			await reader.cancel();
+			source.mockRestore();
+			state.restore();
+		}
+	});
+
+	test('reuses cached bodies and reflects flag changes and an emptied inbox', async () => {
+		const state = await fixture();
+		const source = spyOn(state.client, 'fetchOne').mockResolvedValue({
+			source: Buffer.from('From: friend@example.com\r\nContent-Type: text/plain\r\n\r\nCached body')
+		} as never);
+		try {
+			await state.syncInbox('alice', 'account-alice', state.client);
+			state.headers[0].flags.add('\\Seen');
+			await state.syncInbox('alice', 'account-alice', state.client);
+			expect(source).toHaveBeenCalledTimes(1);
+			expect(snapshot('alice').messages[0].read).toBe(true);
+			expect(snapshot('alice').messages[0].text).toContain('Cached body');
+			state.client.mailbox = { exists: 0, uidValidity: 1n } as never;
+			await state.syncInbox('alice', 'account-alice', state.client);
+			expect(snapshot('alice').messages).toEqual([]);
+		} finally {
+			source.mockRestore();
+			state.restore();
+		}
+	});
+});

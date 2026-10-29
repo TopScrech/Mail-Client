@@ -86,7 +86,10 @@
 			{#if message.html}
 				<HtmlMessage html={message.html} />
 			{:else}
-				<div class="mail-body">{message.text || 'This message has no text content'}</div>
+				<div class="mail-body">
+					{message.text ||
+						(message.html === undefined ? 'Loading message…' : 'This message has no text content')}
+				</div>
 			{/if}
 			{#if message.attachments.length}<div class="attachments">
 					{#each message.attachments as file}<a

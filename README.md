@@ -91,7 +91,8 @@ The Sent, Archive, and Trash folders must advertise their IMAP special-use flags
 
 - The Bun server is the source of truth, with per-user revision numbers and a `204` response when nothing changed
 - Signed-in web clients receive revision notifications through authenticated Server-Sent Events and fetch fresh state when it changes
-- The server maintains one IMAP IDLE connection per connected account’s inbox, even with no browser open — new messages, flag changes, and deletions trigger a debounced sync
+- The server maintains one IMAP IDLE connection per connected account’s inbox, even with no browser open — new messages, flag changes, and deletions trigger a debounced inbox sync over the existing connection
+- Message headers are published before body downloads finish — the reader shows a loading message until content arrives
 - All supported folders reconcile every 10 minutes and after IMAP reconnects — changes outside the inbox may wait for reconciliation or manual refresh
 - IMAP connections retry with exponential backoff from 1 to 60 seconds — accounts requiring authentication reconnect stay paused until credentials are replaced
 - Browsers fetch the latest revision on SSE reconnect, focus, and every 10 minutes, with a 1-minute state polling fallback while the stream is disconnected
