@@ -330,17 +330,102 @@ export function message(userId: string, id: string) {
 	assert(row, 'Message not found', 404);
 	return JSON.parse(row.data) as Message;
 }
+interface PendingMove {
+	message_id: string;
+	account_id: string;
+	changes: string;
+	message: string;
+}
+const moveWorkers = new Map<string, Promise<void>>();
+export function queueMessageMove(
+	userId: string,
+	id: string,
+	change: { read?: boolean; starred?: boolean; folder: Folder }
+) {
+	const mail = message(userId, id);
+	db.transaction(() => {
+		db.query('INSERT INTO pending_moves VALUES (?,?,?,?,?) ON CONFLICT(message_id) DO NOTHING').run(
+			id,
+			userId,
+			mail.accountId,
+			JSON.stringify(change),
+			JSON.stringify(mail)
+		);
+		bump(userId);
+	})();
+}
+export function processPendingMoves(userId: string): Promise<void> {
+	const running = moveWorkers.get(userId);
+	if (running) return running;
+	const worker = serialized(userId, async () => {
+		let move: PendingMove | null;
+		while (
+			(move = one<PendingMove>(
+				'SELECT * FROM pending_moves WHERE user_id=? ORDER BY rowid LIMIT 1',
+				userId
+			))
+		) {
+			try {
+				await updateMessage(
+					userId,
+					move.message_id,
+					JSON.parse(move.changes),
+					JSON.parse(move.message)
+				);
+			} catch (error) {
+				const row = one<{ data: string }>(
+					'SELECT data FROM accounts WHERE id=? AND user_id=?',
+					move.account_id,
+					userId
+				);
+				if (row) {
+					const data: MailAccount = JSON.parse(row.data);
+					if (!data.reconnectRequired) {
+						data.error = 'A message could not be moved — it was restored, try again';
+					}
+					db.transaction(() => {
+						db.query('INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING').run(
+							move!.message_id,
+							userId,
+							move!.account_id,
+							move!.message
+						);
+						db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
+							JSON.stringify(data),
+							move!.account_id,
+							userId
+						);
+					})();
+				}
+			} finally {
+				db.transaction(() => {
+					db.query('DELETE FROM pending_moves WHERE message_id=? AND user_id=?').run(
+						move!.message_id,
+						userId
+					);
+					bump(userId);
+				})();
+			}
+		}
+	}).finally(() => {
+		if (moveWorkers.get(userId) === worker) moveWorkers.delete(userId);
+	});
+	moveWorkers.set(userId, worker);
+	return worker;
+}
 export async function updateMessage(
 	userId: string,
 	id: string,
-	change: { read?: boolean; starred?: boolean; folder?: Folder }
+	change: { read?: boolean; starred?: boolean; folder?: Folder },
+	original?: Message
 ) {
-	const mail = message(userId, id);
+	const mail = original || message(userId, id);
 	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
 	const client = imap(data, credentials);
 	try {
 		await connectImap(client, userId, data.id);
 		const target = change.folder ? await destination(client, change.folder) : null;
+		let moved: Message | undefined;
 		const lock = await client.getMailboxLock(mail.path);
 		try {
 			assert(
@@ -354,14 +439,34 @@ export async function updateMessage(
 			};
 			if (typeof change.read === 'boolean') await flags('\\Seen', change.read);
 			if (typeof change.starred === 'boolean') await flags('\\Flagged', change.starred);
-			if (target && target !== mail.path) await client.messageMove(mail.uid, target, { uid: true });
+			if (target && target !== mail.path) {
+				const result = await client.messageMove(mail.uid, target, { uid: true });
+				assert(result, 'Message could not be moved — sync and try again', 409);
+				const uid = result.uidMap?.get(mail.uid);
+				if (uid && result.uidValidity) {
+					const uidValidity = result.uidValidity.toString();
+					moved = {
+						...mail,
+						...change,
+						folder: change.folder!,
+						path: target,
+						uid,
+						uidValidity,
+						id: `${mail.accountId}:${encodeURIComponent(target)}:${uidValidity}:${uid}`
+					};
+				}
+			}
 		} finally {
 			lock.release();
 		}
 		db.transaction(() => {
-			if (target && target !== mail.path)
+			if (target && target !== mail.path) {
 				db.query('DELETE FROM messages WHERE id=? AND user_id=?').run(id, userId);
-			else
+				if (moved)
+					db.query(
+						'INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data'
+					).run(moved.id, userId, moved.accountId, JSON.stringify(moved));
+			} else
 				db.query('UPDATE messages SET data=? WHERE id=? AND user_id=?').run(
 					JSON.stringify({ ...mail, ...change }),
 					id,

@@ -21,6 +21,8 @@ import {
 	connectAccount,
 	syncAccount,
 	updateMessage,
+	queueMessageMove,
+	processPendingMoves,
 	attachment,
 	send
 } from '$lib/server/mail';
@@ -65,6 +67,7 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return json(await passkeyVerify(event, false, await body(event)));
 	const auth = requireSession(event);
 	const uid = auth.user_id;
+	if (path === 'sync' && method === 'GET') void processPendingMoves(uid).catch(() => {});
 	if (path.startsWith('mail/oauth/') && method === 'GET') {
 		const [, , providerName, operation] = path.split('/');
 		const provider = mailProvider(providerName);
@@ -198,6 +201,9 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		if (input.folder) {
 			assert(['inbox', 'archive', 'trash'].includes(input.folder), 'Invalid destination');
 			change.folder = input.folder;
+			queueMessageMove(uid, input.id, { ...change, folder: input.folder });
+			void processPendingMoves(uid).catch(() => {});
+			return json({ ok: true, pending: true, ...snapshot(uid) }, { status: 202 });
 		}
 		return serialized(uid, async () => {
 			await updateMessage(uid, input.id, change);

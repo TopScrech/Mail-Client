@@ -51,7 +51,11 @@ Accounts with rejected mail credentials report `reconnectRequired: true` and a r
 
 For Google and Microsoft accounts, repeat the mail OAuth flow with the same email to replace authorization while keeping the existing account and cached mail
 
-Message updates return `{ ok: true, ...Snapshot }` after the provider confirms the change, allowing clients to reconcile immediately without another fetch
+Flag updates return `{ ok: true, ...Snapshot }` after provider confirmation
+
+Moves return HTTP 202 with `{ ok: true, pending: true, ...Snapshot }` after saving the intent in the database — pending messages stay hidden across refreshes and mailbox syncs while the provider completes the move
+
+Sync polling resumes persisted moves after a server restart — a failed move restores the cached message and records an account warning
 
 Message identifiers include the account, folder path, UIDVALIDITY, and UID — treat them as opaque strings and URI-encode them where needed
 

@@ -623,35 +623,87 @@ describe('Message move reconciliation', () => {
 			}),
 			spyOn(ImapFlow.prototype, 'messageMove').mockImplementation(async () => {
 				if (failure) throw new Error('Provider unavailable');
-				return true as never;
+				return { path: 'INBOX', destination: 'Trash', uidValidity: 2n, uidMap: new Map([[7, 42]]) };
 			})
 		];
 		return () => mocks.forEach((mock) => mock.mockRestore());
 	}
-	test('move response includes the committed snapshot without another sync request', async () => {
+	test('move is saved immediately even while a slow sync holds the mail lock', async () => {
 		const restore = await mockMove();
+		const { serialized, processPendingMoves } = await import('../src/lib/server/mail');
+		let release!: () => void;
+		const slowSync = serialized(
+			'alice',
+			() =>
+				new Promise<void>((resolve) => {
+					release = resolve;
+				})
+		);
+		await Promise.resolve();
 		const revision = snapshot('alice').revision;
 		try {
 			const response = await PATCH(event('messages', 'PATCH', { id: 'moving', folder: 'trash' }));
-			expect(response.status).toBe(200);
+			expect(response.status).toBe(202);
 			const body = await response.json();
-			expect(body.ok).toBe(true);
+			expect(body.pending).toBe(true);
 			expect(body.revision).toBeGreaterThan(revision);
 			expect(body.messages).toEqual([]);
-			expect(body.accounts[0].id).toBe('account-alice');
+			// A refreshed page gets the persisted pending state while the provider is still blocked
+			const refreshed = await (await GET(event('sync'))).json();
+			expect(refreshed.messages).toEqual([]);
+			expect(one('SELECT message_id FROM pending_moves WHERE user_id=?', 'alice')).not.toBeNull();
+			expect(one('SELECT id FROM messages WHERE id=?', 'moving')).not.toBeNull();
 		} finally {
+			release();
+			await slowSync;
+			await processPendingMoves('alice');
 			restore();
 		}
+		expect(snapshot('alice').messages[0].folder).toBe('trash');
+		expect(snapshot('alice').messages[0].id).toBe('account-alice:Trash:2:42');
+		expect(one('SELECT message_id FROM pending_moves')).toBeNull();
 	});
 	test('failed provider move keeps the cached message available for rollback', async () => {
 		const restore = await mockMove(true);
 		const revision = snapshot('alice').revision;
 		try {
 			const response = await PATCH(event('messages', 'PATCH', { id: 'moving', folder: 'trash' }));
-			expect(response.status).toBe(500);
-			expect(snapshot('alice').revision).toBe(revision);
+			expect(response.status).toBe(202);
+			const { processPendingMoves } = await import('../src/lib/server/mail');
+			await processPendingMoves('alice');
+			expect(snapshot('alice').revision).toBeGreaterThan(revision);
+			expect(snapshot('alice').accounts[0].error).toContain('restored');
+			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
 			expect(snapshot('alice').messages[0].id).toBe('moving');
 			expect(snapshot('alice').messages[0].folder).toBe('inbox');
+		} finally {
+			restore();
+		}
+	});
+	test('sync resumes a persisted move without relying on the original request', async () => {
+		const restore = await mockMove();
+		const { queueMessageMove, processPendingMoves } = await import('../src/lib/server/mail');
+		try {
+			queueMessageMove('alice', 'moving', { folder: 'trash' });
+			expect(snapshot('alice').messages).toEqual([]);
+			expect(one('SELECT message_id FROM pending_moves')).not.toBeNull();
+			await GET(event('sync'));
+			await processPendingMoves('alice');
+			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
+			expect(one('SELECT id FROM messages WHERE id=?', 'moving')).toBeNull();
+		} finally {
+			restore();
+		}
+	});
+	test('users cannot queue moves for another user’s messages', async () => {
+		const restore = await mockMove();
+		try {
+			const response = await PATCH(
+				event('messages', 'PATCH', { id: 'moving', folder: 'trash' }, 'bob')
+			);
+			expect(response.status).toBe(404);
+			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
+			expect(snapshot('alice').messages[0].id).toBe('moving');
 		} finally {
 			restore();
 		}

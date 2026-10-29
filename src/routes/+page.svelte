@@ -33,6 +33,9 @@
 	let connect = $state(false);
 	let reconnectingAccount = $state<MailAccount | null>(null);
 	let reconnectAccounts = $derived(mailbox.accounts.filter((account) => account.reconnectRequired));
+	let accountWarnings = $derived(
+		mailbox.accounts.filter((account) => account.error && !account.reconnectRequired)
+	);
 	let settings = $state(false);
 	let composer = $state<Draft | null>(null);
 	let mobileReading = $state(false);
@@ -254,14 +257,15 @@
 				mobileReading = false;
 			}
 		}
-		const previous = messageChanges.get(message.id) || Promise.resolve();
+		const previous = change.folder
+			? Promise.resolve()
+			: messageChanges.get(message.id) || Promise.resolve();
 		const operation = previous.then(async () => {
 			try {
 				if (profile?.id !== userId || demo) return;
 				const next = await api<Snapshot>('messages', 'PATCH', { id: message.id, ...change });
 				if (profile?.id !== userId || demo) return;
 				if (next.revision >= mailbox.revision) mailbox = next;
-				if (change.folder) void syncMail();
 			} catch (e) {
 				if (profile?.id !== userId || demo) return;
 				error = e instanceof Error ? e.message : 'Could not update this message';
@@ -557,7 +561,17 @@
 				<button disabled={busy} onclick={() => reconnectAccount(account)}>Reconnect account</button>
 			</div>
 		{/each}
-		{#if syncWarning && !reconnectAccounts.length}<div class="sync-warning" role="status">
+		{#each accountWarnings as account (account.id)}
+			<div class="sync-warning" role="alert">
+				<Icon name="cloud" size={16} />
+				<span>{account.email}: {account.error}</span>
+				<button onclick={syncMail} disabled={syncing}>Try again</button>
+			</div>
+		{/each}
+		{#if syncWarning && !reconnectAccounts.length && !accountWarnings.length}<div
+				class="sync-warning"
+				role="status"
+			>
 				<Icon name="cloud" size={16} />{syncWarning}<button onclick={syncMail} disabled={syncing}
 					>Try again</button
 				>

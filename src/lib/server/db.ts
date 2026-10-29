@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS passkeys (id TEXT PRIMARY KEY, user_id TEXT NOT NULL 
 CREATE TABLE IF NOT EXISTS challenges (id TEXT PRIMARY KEY, kind TEXT NOT NULL, data TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, data TEXT NOT NULL, secret TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS pending_moves (message_id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, changes TEXT NOT NULL, message TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS pending_moves_owner ON pending_moves(user_id);
 CREATE INDEX IF NOT EXISTS messages_owner ON messages(user_id, account_id);
 CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rate_limits (id TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
@@ -41,9 +43,11 @@ export function snapshot(userId: string): Snapshot {
 		accounts: all<{ data: string }>('SELECT data FROM accounts WHERE user_id=?', userId).map((x) =>
 			JSON.parse(x.data)
 		),
-		messages: all<{ data: string }>('SELECT data FROM messages WHERE user_id=?', userId).map((x) =>
-			JSON.parse(x.data)
-		),
+		messages: all<{ data: string }>(
+			'SELECT data FROM messages WHERE user_id=? AND id NOT IN (SELECT message_id FROM pending_moves WHERE user_id=?)',
+			userId,
+			userId
+		).map((x) => JSON.parse(x.data)),
 		drafts: all<{ data: string }>('SELECT data FROM drafts WHERE user_id=?', userId).map((x) =>
 			JSON.parse(x.data)
 		)
