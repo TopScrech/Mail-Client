@@ -30,6 +30,9 @@
 		{ id: 'archive', label: 'Archive', icon: 'archive' },
 		{ id: 'trash', label: 'Trash', icon: 'trash' }
 	];
+	let draftCount = $derived(
+		state.drafts.filter((draft) => !selectedAccount || draft.accountId === selectedAccount).length
+	);
 	let unread = $derived(
 		state.messages.filter(
 			(m) =>
@@ -45,15 +48,27 @@
 	<button class="compose-button" onclick={oncompose}
 		><Icon name="compose" size={18} /> New message <kbd>N</kbd></button
 	>
+	<label class="section-label" for="mailbox-account">ACCOUNT</label>
+	<select
+		id="mailbox-account"
+		class="mailbox-account"
+		value={selectedAccount}
+		onchange={(event) => onaccount(event.currentTarget.value)}
+	>
+		<option value="">All accounts</option>
+		{#each state.accounts as account (account.id)}
+			<option value={account.id}>{account.name} — {account.email}</option>
+		{/each}
+	</select>
 	<div class="section-label">MAILBOX</div>
 	<nav aria-label="Mailboxes">
 		{#each folders as item}<button
 				class:active={folder === item.id}
+				aria-current={folder === item.id ? 'page' : undefined}
 				onclick={() => onfolder(item.id)}
 				><Icon name={item.icon} size={19} /><span class="folder-label">{item.label}</span
 				>{#if item.id === 'inbox' && unread}<span class="count">{unread}</span
-					>{:else if item.id === 'drafts' && state.drafts.length}<span class="count"
-						>{state.drafts.length}</span
+					>{:else if item.id === 'drafts' && draftCount}<span class="count">{draftCount}</span
 					>{/if}</button
 			>{/each}
 	</nav>

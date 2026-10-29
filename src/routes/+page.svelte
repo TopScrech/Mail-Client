@@ -65,15 +65,24 @@
 		mobileReading = false;
 		try {
 			const saved = JSON.parse(localStorage.getItem(selectionKey) || 'null');
-			const message = mailbox.messages.find((message) => message.id === saved?.selected);
+			if (mailbox.accounts.some((account) => account.id === saved?.selectedAccount)) {
+				selectedAccount = saved.selectedAccount;
+			}
+			if (['inbox', 'starred', 'sent', 'drafts', 'archive', 'trash'].includes(saved?.folder)) {
+				folder = saved.folder;
+			}
+			query = typeof saved?.query === 'string' ? saved.query : '';
+			const message = mailbox.messages.find(
+				(message) =>
+					message.id === saved?.selected &&
+					(!selectedAccount || message.accountId === selectedAccount)
+			);
 			if (message) {
 				selected = message.id;
-				selectedAccount = saved.selectedAccount === message.accountId ? message.accountId : '';
 				folder =
 					saved.folder === 'starred' && message.starred && message.folder !== 'trash'
 						? 'starred'
 						: message.folder;
-				query = typeof saved.query === 'string' ? saved.query : '';
 				mobileReading = saved.mobileReading !== false;
 			}
 		} catch {
@@ -166,7 +175,13 @@
 		demo = true;
 		mailbox = demoSnapshot();
 		restoreSelection();
-		if (!selected) selected = mailbox.messages[0].id;
+		if (!selected && folder === 'inbox' && !query) {
+			selected =
+				mailbox.messages.find(
+					(message) =>
+						message.folder === folder && (!selectedAccount || message.accountId === selectedAccount)
+				)?.id || '';
+		}
 		error = '';
 	}
 	function leavePreview() {
@@ -182,6 +197,19 @@
 		}
 		return true;
 	}
+	function selectAccount(id: string) {
+		selectedAccount = id;
+		selectFolder(folder);
+	}
+	$effect(() => {
+		if (
+			mailbox.revision >= 0 &&
+			selectedAccount &&
+			!mailbox.accounts.some((account) => account.id === selectedAccount)
+		) {
+			selectAccount('');
+		}
+	});
 	function selectFolder(value: Folder) {
 		folder = value;
 		selected = '';
@@ -413,11 +441,7 @@
 				{selectedAccount}
 				name={profile?.name || 'Alex Morgan'}
 				onfolder={selectFolder}
-				onaccount={(id) => {
-					selectedAccount = id;
-					selected = '';
-					mobileSidebar = false;
-				}}
+				onaccount={selectAccount}
 				oncompose={() => compose()}
 				onconnect={() => {
 					if (requireReal()) {
@@ -502,8 +526,7 @@
 		{demo}
 		{selectedAccount}
 		onaccount={(id) => {
-			selectedAccount = id;
-			selected = '';
+			selectAccount(id);
 			settings = false;
 		}}
 		accounts={mailbox.accounts}
