@@ -233,7 +233,10 @@
 			mailbox.messages = mailbox.messages.map((m) =>
 				m.id === message.id ? ({ ...m, ...change } as Message) : m
 			);
-			if (change.folder) selected = '';
+			if (change.folder) {
+				selected = '';
+				mobileReading = false;
+			}
 			return;
 		}
 		await action(async () => {
@@ -377,6 +380,22 @@
 			'input, textarea, select, [contenteditable="true"]'
 		);
 		if (editing || composer || settings || connect || (!profile && !demo)) return;
+		if (
+			(e.key === 'Delete' || e.key === 'Backspace') &&
+			!e.metaKey &&
+			!e.ctrlKey &&
+			!e.altKey &&
+			!e.shiftKey &&
+			!e.repeat &&
+			!e.isComposing &&
+			!busy &&
+			active &&
+			active.folder !== 'trash'
+		) {
+			e.preventDefault();
+			void changeMessage({ folder: 'trash' });
+			return;
+		}
 		if (e.key.toLowerCase() === 'n' && !e.metaKey && !e.ctrlKey && !e.altKey) {
 			e.preventDefault();
 			compose();

@@ -34,7 +34,8 @@
 			><button
 				class="icon-button"
 				aria-label="Move to trash"
-				title="Move to trash"
+				aria-keyshortcuts="Delete Backspace"
+				title="Move to trash (Delete)"
 				disabled={!message || busy}
 				onclick={() => onchange({ folder: 'trash' })}><Icon name="trash" size={19} /></button
 			><span class="toolbar-divider"></span><button
