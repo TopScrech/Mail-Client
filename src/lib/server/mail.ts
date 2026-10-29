@@ -36,7 +36,7 @@ export function account(userId: string, id: string) {
 		credentials: JSON.parse(decrypt(row.secret, `${userId}:${id}`)) as Credentials
 	};
 }
-function recordAuthFailure(userId: string, id: string, error: unknown) {
+export function recordAuthFailure(userId: string, id: string, error: unknown) {
 	if (!isMailAuthError(error)) return;
 	const row = one<{ data: string }>(
 		'SELECT data FROM accounts WHERE id=? AND user_id=?',
@@ -61,12 +61,15 @@ async function authorizedAccount(userId: string, id: string) {
 	const result = account(userId, id);
 	try {
 		if (result.credentials.oauth) {
-			result.credentials.oauth = await refreshOAuth(result.credentials.oauth);
-			db.query('UPDATE accounts SET secret=? WHERE id=? AND user_id=?').run(
-				encrypt(JSON.stringify(result.credentials), `${userId}:${id}`),
-				id,
-				userId
-			);
+			const previous = result.credentials.oauth;
+			result.credentials.oauth = await refreshOAuth(previous);
+			if (result.credentials.oauth !== previous) {
+				db.query('UPDATE accounts SET secret=? WHERE id=? AND user_id=?').run(
+					encrypt(JSON.stringify(result.credentials), `${userId}:${id}`),
+					id,
+					userId
+				);
+			}
 		}
 	} catch (error) {
 		recordAuthFailure(userId, id, error);
@@ -89,7 +92,7 @@ function validateHost(host: string) {
 		'This mail host is not enabled by the server operator'
 	);
 }
-function imap(data: MailAccount, credentials: Credentials) {
+function imap(data: MailAccount, credentials: Credentials, idle = false) {
 	validateHost(data.imapHost);
 	const client = new ImapFlow({
 		host: data.imapHost,
@@ -101,11 +104,19 @@ function imap(data: MailAccount, credentials: Credentials) {
 		logger: false,
 		connectionTimeout: 15_000,
 		greetingTimeout: 15_000,
-		socketTimeout: 30_000,
+		socketTimeout: idle ? 300_000 : 30_000,
+		maxIdleTime: idle ? 240_000 : undefined,
+		autoIdleDelay: idle ? 0 : undefined,
 		tls: { rejectUnauthorized: true }
 	});
 	client.on('error', () => {});
 	return client;
+}
+export async function idleClient(userId: string, id: string) {
+	return serialized(userId, async () => {
+		const { data, credentials } = await authorizedAccount(userId, id);
+		return imap(data, credentials, true);
+	});
 }
 function smtp(data: MailAccount, credentials: Credentials) {
 	validateHost(data.smtpHost);
@@ -281,7 +292,7 @@ export async function syncAccount(userId: string, id: string) {
 						subject: envelope.subject || '(No subject)',
 						text,
 						html,
-						date: envelope.date?.toISOString() || now(),
+						date: envelope.date ? new Date(envelope.date).toISOString() : now(),
 						read: header.flags?.has('\\Seen') || false,
 						starred: header.flags?.has('\\Flagged') || false,
 						messageId: envelope.messageId || '',

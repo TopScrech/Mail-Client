@@ -3,6 +3,7 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { ApiError } from './config';
 import type { Snapshot } from '$lib/types';
+import { changed } from './events';
 const path = process.env.DATABASE_PATH || './data/mail-otter.sqlite';
 if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 export const db = new Database(path, { create: true });
@@ -36,6 +37,7 @@ export function all<T>(sql: string, ...params: (string | number)[]) {
 }
 export function bump(userId: string) {
 	db.query('UPDATE users SET revision=revision+1 WHERE id=?').run(userId);
+	changed(userId);
 }
 export function snapshot(userId: string): Snapshot {
 	return db.transaction(() => ({

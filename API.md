@@ -33,6 +33,7 @@ Registration never creates a user — Apple signup must happen first
 | Method | Path                                   | Body or query                                                                                                             |
 | ------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | GET    | `/sync?since=<revision>`               | Returns `Snapshot`, or HTTP 204 when the revision matches                                                                 |
+| GET    | `/events`                             | Authenticated SSE stream — sends `event: revision` with the current revision as numeric `data` on connect and after committed changes |
 | POST   | `/accounts`                            | `{ name, email, username?, password, imapHost, smtpHost, smtpPort }` — validates IMAP and SMTP before storing credentials |
 | POST   | `/accounts/:id/reconnect` | Same body as `/accounts` with the existing email — verifies credentials and keeps the account ID, cached messages, and drafts |
 | DELETE | `/accounts/:id`                        | Disconnects from all devices and removes cached mail and associated drafts — provider mail is untouched                   |
@@ -55,7 +56,15 @@ Flag updates return `{ ok: true, ...Snapshot }` after provider confirmation
 
 Moves return HTTP 202 with `{ ok: true, pending: true, ...Snapshot }` after saving the intent in the database — pending messages stay hidden across refreshes and mailbox syncs while the provider completes the move
 
-Sync polling resumes persisted moves after a server restart — a failed move restores the cached message and records an account warning
+Background reconciliation and sync requests resume persisted moves after a server restart — a failed move restores the cached message and records an account warning
+
+The events stream sends a heartbeat comment every 15 seconds and rechecks session validity before each write — logout and session revocation close matching streams immediately
+
+Fetch `/sync?since=<revision>` after a newer revision notification and after reconnecting — notifications are invalidations, with no replay history, and the initial event always announces the latest revision
+
+Up to 6 streams may share one session — slow consumers are disconnected instead of buffering indefinitely, and EventSource automatically reconnects
+
+The server watches each connected inbox using IMAP IDLE and reconciles all supported folders every 10 minutes, independently of browser activity — authentication failures pause listeners until the account is reconnected
 
 Message identifiers include the account, folder path, UIDVALIDITY, and UID — treat them as opaque strings and URI-encode them where needed
 

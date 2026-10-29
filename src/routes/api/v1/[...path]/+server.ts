@@ -28,6 +28,7 @@ import {
 } from '$lib/server/mail';
 import type { Draft, Folder } from '$lib/types';
 import { hash } from '$lib/server/crypto';
+import { closeSessionStreams, eventStream } from '$lib/server/event-stream';
 async function body(event: RequestEvent) {
 	try {
 		return await event.request.json();
@@ -67,6 +68,7 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return json(await passkeyVerify(event, false, await body(event)));
 	const auth = requireSession(event);
 	const uid = auth.user_id;
+	if (path === 'events' && method === 'GET') return eventStream(event, auth);
 	if (path === 'sync' && method === 'GET') void processPendingMoves(uid).catch(() => {});
 	if (path.startsWith('mail/oauth/') && method === 'GET') {
 		const [, , providerName, operation] = path.split('/');
@@ -103,12 +105,14 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return json(await passkeyVerify(event, true, await body(event)));
 	if (path === 'auth/logout' && method === 'POST') {
 		db.query('DELETE FROM sessions WHERE id=?').run(auth.id);
+		closeSessionStreams(auth.id);
 		event.cookies.delete('session', { path: '/' });
 		return json({ ok: true });
 	}
 	if (path.startsWith('sessions/') && method === 'DELETE') {
 		const id = path.slice(9);
 		db.query('DELETE FROM sessions WHERE id=? AND user_id=?').run(id, uid);
+		if (!one('SELECT id FROM sessions WHERE id=?', id)) closeSessionStreams(id);
 		if (id === auth.id) event.cookies.delete('session', { path: '/' });
 		return json({ ok: true });
 	}
@@ -358,7 +362,7 @@ async function handle(event: RequestEvent) {
 			});
 		}
 		const response = await dispatch(event);
-		response.headers.set('cache-control', 'no-store');
+		if (!response.headers.has('cache-control')) response.headers.set('cache-control', 'no-store');
 		return response;
 	} catch (error) {
 		const status = error instanceof ApiError ? error.status : 500;

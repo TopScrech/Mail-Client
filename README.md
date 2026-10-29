@@ -90,14 +90,18 @@ The Sent, Archive, and Trash folders must advertise their IMAP special-use flags
 ## Sync behavior
 
 - The Bun server is the source of truth, with per-user revision numbers and a `204` response when nothing changed
-- Visible web clients check shared workspace state every 5 seconds and on focus
-- Connected mail accounts refresh every 2 minutes while the client is visible, on sign-in, or when manually refreshed
+- Signed-in web clients receive revision notifications through authenticated Server-Sent Events and fetch fresh state when it changes
+- The server maintains one IMAP IDLE connection per connected account’s inbox, even with no browser open — new messages, flag changes, and deletions trigger a debounced sync
+- All supported folders reconcile every 10 minutes and after IMAP reconnects — changes outside the inbox may wait for reconciliation or manual refresh
+- IMAP connections retry with exponential backoff from 1 to 60 seconds — accounts requiring authentication reconnect stay paused until credentials are replaced
+- Browsers fetch the latest revision on SSE reconnect, focus, and every 10 minutes, with a 1-minute state polling fallback while the stream is disconnected
+- Mail accounts also refresh on sign-in and manual refresh — providers without IDLE use ImapFlow’s command fallback plus periodic reconciliation
 - Sync caches the newest 50 messages in each supported folder per account, up to 10 accounts
 - Search covers this cached window, not the provider’s full mailbox
 - Draft saves use optimistic concurrency based on the original `updatedAt` value — stale edits return `409` and remain open in the composer
 - Attachments are sent immediately or downloaded on demand — unsent attachments stay on the composing device and are not part of saved drafts
 - Operations for a workspace are serialized inside one Bun process — deploy one application replica with a persistent database volume
-- There is no background worker, push delivery, offline compose persistence, or full mailbox pagination in this version
+- There is no offline compose persistence, full mailbox pagination, or browser push notification delivery in this version — SSE updates open clients only
 
 ## Storage and deployment
 
@@ -111,6 +115,8 @@ bun run start
 For production, set `ORIGIN` to the HTTPS public domain, `RP_ID` to its hostname, and `BODY_SIZE_LIMIT=16777216`
 
 Deploy the Bun server behind an HTTPS reverse proxy with request timeouts long enough for initial IMAP sync — Apple authentication, SMTP, and IMAP require outbound network access
+
+Allow streaming responses for `/api/v1/events`, disable proxy buffering and response compression for that endpoint, and allow idle timeouts longer than the 15-second SSE heartbeat — the response includes `X-Accel-Buffering: no` and `Cache-Control: no-store, no-transform`
 
 A Dockerfile is included:
 

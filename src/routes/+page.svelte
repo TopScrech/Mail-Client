@@ -131,8 +131,36 @@
 	async function loadProfile() {
 		profile = await api<Profile>('me');
 	}
+	let pulling = false;
+	let pullAgain = false;
+	let live = false;
+	$effect(() => {
+		if (!profile || demo) return;
+		const source = new EventSource('/api/v1/events');
+		source.onopen = () => {
+			live = true;
+			void pull();
+		};
+		source.addEventListener('revision', (event) => {
+			if (Number((event as MessageEvent).data) > mailbox.revision) void pull();
+		});
+		source.onerror = () => {
+			live = false;
+			// Also detect expired or revoked sessions when EventSource cannot expose the HTTP status
+			void pull();
+		};
+		return () => {
+			live = false;
+			source.close();
+		};
+	});
 	async function pull() {
 		if (demo || !profile) return;
+		if (pulling) {
+			pullAgain = true;
+			return;
+		}
+		pulling = true;
 		const userId = profile.id;
 		try {
 			const next = await api<Snapshot | null>(`sync?since=${mailbox.revision}`);
@@ -144,11 +172,18 @@
 			}
 			syncWarning = '';
 		} catch (e) {
+			if (profile?.id !== userId) return;
 			if (e instanceof RequestError && e.status === 401) {
 				profile = null;
 				mailbox = { revision: -1, accounts: [], messages: [], drafts: [] };
 				notice('Your session ended — sign in again');
 			} else syncWarning = 'Device sync paused — trying again shortly';
+		} finally {
+			pulling = false;
+			if (pullAgain) {
+				pullAgain = false;
+				void pull();
+			}
 		}
 	}
 	async function syncMail() {
@@ -469,16 +504,16 @@
 			}
 		})();
 		const interval = setInterval(() => {
+			if (!live && document.visibilityState === 'visible') void pull();
+		}, 60_000);
+		const reconcile = setInterval(() => {
 			if (document.visibilityState === 'visible') void pull();
-		}, 5000);
-		const mailInterval = setInterval(() => {
-			if (document.visibilityState === 'visible') void syncMail();
-		}, 120_000);
+		}, 600_000);
 		const focus = () => void pull();
 		window.addEventListener('focus', focus);
 		return () => {
 			clearInterval(interval);
-			clearInterval(mailInterval);
+			clearInterval(reconcile);
 			clearTimeout(toastTimer);
 			window.removeEventListener('focus', focus);
 		};

@@ -7,7 +7,7 @@
 		"dev": "bun --bun vite --host localhost",
 		"build": "bun --bun vite build",
 		"start": "bun build/index.js",
-		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check": "svelte-kit sync && svelte-check --tsgo --tsconfig ./tsconfig.json",
 		"test": "bun test",
 		"format": "prettier --write src tests"
 	},
@@ -26,11 +26,12 @@
 		"@types/bun": "latest",
 		"@types/mailparser": "^3.4.6",
 		"@types/nodemailer": "^8.0.2",
+		"@typescript/native": "npm:typescript@^7.0.2",
 		"prettier": "^3.9.9",
 		"prettier-plugin-svelte": "^4.1.1",
 		"svelte": "^5.57.1",
 		"svelte-check": "^4.7.6",
-		"typescript": "^7.0.2",
+		"typescript": "~6",
 		"vite": "^8.3.0"
 	},
 	"overrides": {

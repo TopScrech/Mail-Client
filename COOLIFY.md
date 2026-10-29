@@ -73,6 +73,10 @@ Save runtime variables before deploying — after changing them, restart or rede
 
 The host must allow outbound HTTPS, IMAP TLS on port 993, and SMTP on 465 or 587
 
+Keep the application running to receive mail while browsers are closed — background IMAP listeners and 10-minute reconciliation start with the server
+
+For `/api/v1/events`, allow streaming responses, disable response buffering and compression, and use an idle timeout longer than the 15-second heartbeat — the app sends `X-Accel-Buffering: no` and `Cache-Control: no-store, no-transform`
+
 No Coolify deployment or live Apple/provider sign-in was performed as part of publishing this repository
 
 References: [Coolify Dockerfile configuration](https://coolify.io/docs/applications/builds/dockerfile), [Coolify environment variables](https://coolify.io/docs/applications/configuration/environment-variables)

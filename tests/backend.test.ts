@@ -114,6 +114,92 @@ describe('Authentication boundaries', () => {
 		expect((await GET(event('me'))).status).toBe(401);
 	});
 });
+
+describe('Live device updates', () => {
+	const decode = (value?: Uint8Array) => new TextDecoder().decode(value);
+
+	test('requires authentication and sends the current revision immediately', async () => {
+		expect((await GET(event('events', 'GET', undefined, null))).status).toBe(401);
+		const response = await GET(event('events'));
+		expect(response.headers.get('content-type')).toBe('text/event-stream');
+		expect(response.headers.get('x-accel-buffering')).toBe('no');
+		const reader = response.body!.getReader();
+		expect(decode((await reader.read()).value)).toContain(`data: ${snapshot('alice').revision}`);
+		await reader.cancel();
+	});
+
+	test('delivers committed draft changes to the owner without leaking another user’s changes', async () => {
+		const response = await GET(event('events'));
+		const reader = response.body!.getReader();
+		await reader.read();
+		const { bump } = await import('../src/lib/server/db');
+		bump('bob');
+		await Promise.resolve();
+		const update = reader.read();
+		const draft = {
+			id: 'live-draft',
+			accountId: 'account-alice',
+			to: '',
+			subject: 'Live',
+			text: 'Body',
+			updatedAt: ''
+		};
+		await PUT(event('drafts', 'PUT', { draft }));
+		const chunk = decode((await update).value);
+		expect(chunk).toBe(`event: revision\ndata: ${snapshot('alice').revision}\n\n`);
+		expect(snapshot('alice').drafts[0].subject).toBe('Live');
+		await reader.cancel();
+	});
+
+	test('reconnecting after missed writes announces the latest revision', async () => {
+		const first = (await GET(event('events'))).body!.getReader();
+		await first.read();
+		await first.cancel();
+		const { bump } = await import('../src/lib/server/db');
+		bump('alice');
+		bump('alice');
+		await Promise.resolve();
+		const reader = (await GET(event('events'))).body!.getReader();
+		expect(decode((await reader.read()).value)).toContain(`data: ${snapshot('alice').revision}`);
+		await reader.cancel();
+	});
+
+	test('logout and session revocation close existing streams', async () => {
+		for (const path of ['auth/logout', 'sessions/session-alice']) {
+			const reader = (await GET(event('events'))).body!.getReader();
+			await reader.read();
+			if (path === 'auth/logout') await POST(event(path, 'POST', {}));
+			else await DELETE(event(path, 'DELETE'));
+			expect((await reader.read()).done).toBe(true);
+			// Restore the fixture session for the second revocation path
+			if (path === 'auth/logout')
+				db.query('INSERT INTO sessions VALUES (?,?,?,?,?,?)').run(
+					'session-alice',
+					'alice',
+					hash(tokens.alice),
+					'Test',
+					'',
+					Date.now() + 60_000
+				);
+		}
+	});
+
+	test('expired sessions cannot receive another revision and aborted requests release their slot', async () => {
+		const controller = new AbortController();
+		const request = event('events');
+		request.request = new Request(request.request, { signal: controller.signal });
+		const reader = (await GET(request)).body!.getReader();
+		await reader.read();
+		controller.abort();
+		expect((await reader.read()).done).toBe(true);
+		const next = (await GET(event('events'))).body!.getReader();
+		await next.read();
+		db.query('UPDATE sessions SET expires=0 WHERE id=?').run('session-alice');
+		const { bump } = await import('../src/lib/server/db');
+		bump('alice');
+		expect((await next.read()).done).toBe(true);
+	});
+});
 describe('Device sync and ownership', () => {
 	const draft = {
 		id: 'draft-1',
@@ -331,6 +417,34 @@ describe('Mailbox OAuth', () => {
 		};
 		expect(await refreshOAuth(tokens)).toBe(tokens);
 	});
+	test('preparing IDLE listeners keeps unchanged OAuth credentials stable', async () => {
+		const data = { ...snapshot('alice').accounts[0], imapHost: 'imap.gmail.com' };
+		const secret = encrypt(
+			JSON.stringify({
+				username: data.email,
+				oauth: {
+					provider: 'google',
+					accessToken: 'access',
+					refreshToken: 'refresh',
+					expiresAt: Date.now() + 3600_000
+				}
+			}),
+			'alice:account-alice'
+		);
+		db.query('UPDATE accounts SET data=?,secret=? WHERE id=?').run(
+			JSON.stringify(data),
+			secret,
+			data.id
+		);
+		const { idleClient } = await import('../src/lib/server/mail');
+		const first = await idleClient('alice', data.id);
+		const second = await idleClient('alice', data.id);
+		expect(one<{ secret: string }>('SELECT secret FROM accounts WHERE id=?', data.id)!.secret).toBe(
+			secret
+		);
+		first.close();
+		second.close();
+	});
 });
 
 test('OAuth renewal rotates refresh tokens and reports revoked access safely', async () => {
@@ -410,7 +524,7 @@ describe('Mail account reconnection', () => {
 		const revision = snapshot('alice').revision;
 		try {
 			globalThis.fetch = (async () =>
-				Response.json({ error: 'invalid_grant' }, { status: 400 })) as typeof fetch;
+				Response.json({ error: 'invalid_grant' }, { status: 400 })) as unknown as typeof fetch;
 			const result = await POST(event('mail/sync', 'POST', {}));
 			const body = await result.json();
 			expect(body.accounts[0].reconnectRequired).toBe(true);
@@ -431,7 +545,7 @@ describe('Mail account reconnection', () => {
 		const originalFetch = globalThis.fetch;
 		try {
 			globalThis.fetch = (async () =>
-				Response.json({ error: 'server_error' }, { status: 503 })) as typeof fetch;
+				Response.json({ error: 'server_error' }, { status: 503 })) as unknown as typeof fetch;
 			const result = await POST(event('mail/sync', 'POST', {}));
 			const body = await result.json();
 			expect(body.accounts[0].reconnectRequired).toBe(false);

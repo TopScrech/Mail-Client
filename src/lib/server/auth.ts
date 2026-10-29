@@ -6,7 +6,7 @@ import {
 	verifyAuthenticationResponse,
 	type RegistrationResponseJSON,
 	type AuthenticationResponseJSON,
-	type AuthenticatorTransportFuture
+	type AuthenticatorTransport
 } from '@simplewebauthn/server';
 import { createRemoteJWKSet, importPKCS8, SignJWT, jwtVerify } from 'jose';
 import { db, one, all, challenge, consume, type User } from './db';
@@ -171,7 +171,7 @@ export async function passkeyVerify(
 			id: key.id,
 			publicKey: new Uint8Array(key.public_key),
 			counter: key.counter,
-			transports: JSON.parse(key.transports) as AuthenticatorTransportFuture[]
+			transports: JSON.parse(key.transports) as AuthenticatorTransport[]
 		}
 	});
 	assert(result.verified, 'Passkey could not be verified', 401);
