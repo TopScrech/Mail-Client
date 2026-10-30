@@ -1,4 +1,4 @@
-import { ImapFlow } from 'imapflow';
+import { ImapFlow, type FetchMessageObject } from 'imapflow';
 import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
 import { simpleParser } from 'mailparser';
@@ -102,6 +102,7 @@ function imap(data: MailAccount, credentials: Credentials, idle = false) {
 			? { user: credentials.username, accessToken: credentials.oauth.accessToken }
 			: { user: credentials.username, pass: credentials.password! },
 		logger: false,
+		qresync: true,
 		connectionTimeout: 15_000,
 		greetingTimeout: 15_000,
 		socketTimeout: idle ? 300_000 : 30_000,
@@ -231,7 +232,13 @@ async function destination(client: ImapFlow, folder: Folder) {
 	assert(entry, `Your mail server does not expose a ${folder} folder`, 422);
 	return entry.path;
 }
-// Publish metadata before downloading bodies so large messages cannot delay inbox visibility
+interface FolderCheckpoint {
+	uidValidity: string;
+	modseq?: bigint;
+}
+const checkpoints = new WeakMap<ImapFlow, Map<string, FolderCheckpoint>>();
+
+// Only metadata uses the IDLE connection — body jobs run independently
 async function syncFolder(
 	userId: string,
 	id: string,
@@ -241,82 +248,278 @@ async function syncFolder(
 ) {
 	const lock = await client.getMailboxLock(path);
 	try {
-		const messages: Message[] = [];
 		const mailbox = client.mailbox;
 		assert(mailbox, 'Mailbox is not open', 502);
-		const headers = mailbox.exists
+		const uidValidity = mailbox.uidValidity.toString();
+		const highestAtStart = mailbox.highestModseq;
+		let states = checkpoints.get(client);
+		if (!states) checkpoints.set(client, (states = new Map()));
+		const previous = states.get(path);
+		const canDelta =
+			client.enabled.has('CONDSTORE') &&
+			!mailbox.noModseq &&
+			previous?.uidValidity === uidValidity &&
+			previous.modseq !== undefined &&
+			highestAtStart !== undefined &&
+			highestAtStart >= previous.modseq;
+		const cached = new Map(
+			all<{ data: string }>(
+				'SELECT data FROM messages WHERE account_id=? AND user_id=?',
+				id,
+				userId
+			)
+				.map((row) => JSON.parse(row.data) as Message)
+				.filter((message) => message.path === path && message.uidValidity === uidValidity)
+				.map((message) => [message.uid, message])
+		);
+		// UID membership detects deletions and keeps the 50-message window bounded on every server
+		const members = mailbox.exists
 			? await client.fetchAll(`${Math.max(1, mailbox.exists - 49)}:*`, {
 					uid: true,
-					flags: true,
-					envelope: true,
-					internalDate: true,
-					size: true
+					...(!canDelta ? { flags: true } : {})
 				})
 			: [];
-		for (const header of headers) {
-			if (!header.envelope) continue;
-			const envelope = header.envelope;
-			const uidValidity = mailbox.uidValidity.toString();
-			const messageId = `${id}:${encodeURIComponent(path)}:${uidValidity}:${header.uid}`;
-			const existing = one<{ data: string }>(
-				'SELECT data FROM messages WHERE id=? AND user_id=?',
-				messageId,
-				userId
-			);
-			const cached: Message | undefined = existing ? JSON.parse(existing.data) : undefined;
-			messages.push({
-				id: messageId,
-				accountId: id,
-				folder,
-				path,
-				uid: header.uid,
-				uidValidity,
-				from: envelope.from?.[0]?.name || envelope.from?.[0]?.address || 'Unknown sender',
-				fromAddress: envelope.from?.[0]?.address || '',
-				to: envelope.to?.map((x) => x.address).join(', ') || '',
-				subject: envelope.subject || '(No subject)',
-				text: cached?.text || '',
-				html: cached?.html,
-				date: envelope.date ? new Date(envelope.date).toISOString() : now(),
-				read: header.flags?.has('\\Seen') || false,
-				starred: header.flags?.has('\\Flagged') || false,
-				messageId: envelope.messageId || '',
-				attachments: cached?.attachments || []
-			});
+		const missing = members.filter((header) => !cached.has(header.uid)).map((header) => header.uid);
+		const envelopes = missing.length
+			? await client.fetchAll(
+					missing,
+					{
+						uid: true,
+						flags: true,
+						envelope: true,
+						internalDate: true,
+						size: true
+					},
+					{ uid: true }
+				)
+			: [];
+		const newHeaders = new Map(envelopes.map((header) => [header.uid, header]));
+		const known = members.filter((header) => cached.has(header.uid)).map((header) => header.uid);
+		const changed =
+			canDelta && known.length && highestAtStart !== previous.modseq
+				? await client.fetchAll(
+						known,
+						{ uid: true, flags: true },
+						{ uid: true, changedSince: previous.modseq }
+					)
+				: [];
+		const flags = new Map(
+			(canDelta ? changed : members).map((header) => [header.uid, header.flags])
+		);
+		const messages: Message[] = [];
+		for (const member of members) {
+			const header = newHeaders.get(member.uid);
+			const old = cached.get(member.uid);
+			if (!old && !header?.envelope) continue;
+			const message = old ? { ...old } : fromHeader(id, path, folder, uidValidity, header!);
+			const nextFlags = header?.flags || flags.get(member.uid);
+			if (nextFlags) {
+				message.read = nextFlags.has('\\Seen');
+				message.starred = nextFlags.has('\\Flagged');
+			}
+			messages.push(message);
 		}
 		db.transaction(() => {
-			db.query(
+			const oldRows = all<{ id: string; data: string }>(
 				folder === 'inbox'
-					? "DELETE FROM messages WHERE account_id=? AND user_id=? AND json_extract(data,'$.folder')=?"
-					: "DELETE FROM messages WHERE account_id=? AND user_id=? AND json_extract(data,'$.path')=?"
-			).run(id, userId, folder === 'inbox' ? 'inbox' : path);
-			const insert = db.query('INSERT INTO messages VALUES (?,?,?,?)');
-			for (const message of messages) insert.run(message.id, userId, id, JSON.stringify(message));
-			bump(userId);
-		})();
-		for (const message of messages) {
-			if (message.html !== undefined) continue;
-			const header = headers.find((header) => header.uid === message.uid)!;
-			if ((header.size || 0) > 20 * 1024 * 1024) {
-				message.text = 'This message is larger than 20 MB — open it in your provider’s client';
-				message.html = null;
-			} else {
-				const source = await client.fetchOne(message.uid, { source: true }, { uid: true });
-				if (!source || !source.source) continue;
-				Object.assign(message, await parseMessageBody(source.source));
-			}
-			db.transaction(() => {
-				db.query('UPDATE messages SET data=? WHERE id=? AND user_id=?').run(
-					JSON.stringify(message),
+					? "SELECT id,data FROM messages WHERE account_id=? AND user_id=? AND json_extract(data,'$.folder')=?"
+					: "SELECT id,data FROM messages WHERE account_id=? AND user_id=? AND json_extract(data,'$.path')=?",
+				id,
+				userId,
+				folder === 'inbox' ? 'inbox' : path
+			);
+			const ids = new Set(messages.map((message) => message.id));
+			let dirty = false;
+			for (const old of oldRows)
+				if (!ids.has(old.id)) {
+					db.query('DELETE FROM messages WHERE id=? AND user_id=?').run(old.id, userId);
+					dirty = true;
+				}
+			for (const message of messages) {
+				const current = one<{ data: string }>(
+					'SELECT data FROM messages WHERE id=? AND user_id=?',
 					message.id,
 					userId
 				);
-				bump(userId);
-			})();
-		}
-		return messages;
+				// A body may have finished while metadata was in flight — keep its latest content
+				if (current) {
+					const body: Message = JSON.parse(current.data);
+					message.text = body.text;
+					message.html = body.html;
+					message.attachments = body.attachments;
+				}
+				const data = JSON.stringify(message);
+				if (data !== current?.data) {
+					db.query(
+						'INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data'
+					).run(message.id, userId, id, data);
+					dirty = true;
+				}
+				if (message.html === undefined)
+					db.query(
+						'INSERT OR IGNORE INTO body_jobs (message_id,user_id,account_id,size) VALUES (?,?,?,?)'
+					).run(message.id, userId, id, newHeaders.get(message.uid)?.size || 0);
+			}
+			if (dirty) bump(userId);
+		})();
+		// Store the starting watermark, never a later value that could skip an in-flight change
+		states.set(path, { uidValidity, modseq: highestAtStart });
 	} finally {
 		lock.release();
+	}
+}
+
+function fromHeader(
+	id: string,
+	path: string,
+	folder: Folder,
+	uidValidity: string,
+	header: FetchMessageObject
+): Message {
+	const envelope = header.envelope!;
+	return {
+		id: `${id}:${encodeURIComponent(path)}:${uidValidity}:${header.uid}`,
+		accountId: id,
+		folder,
+		path,
+		uid: header.uid,
+		uidValidity,
+		from: envelope.from?.[0]?.name || envelope.from?.[0]?.address || 'Unknown sender',
+		fromAddress: envelope.from?.[0]?.address || '',
+		to: envelope.to?.map((x) => x.address).join(', ') || '',
+		subject: envelope.subject || '(No subject)',
+		text: '',
+		date: envelope.date ? new Date(envelope.date).toISOString() : now(),
+		read: header.flags?.has('\\Seen') || false,
+		starred: header.flags?.has('\\Flagged') || false,
+		messageId: envelope.messageId || '',
+		attachments: []
+	};
+}
+
+interface BodyJob {
+	message_id: string;
+	size: number;
+	data: string;
+}
+function nextBodyJob(userId: string, id: string) {
+	return one<BodyJob>(
+		`SELECT j.message_id,j.size,m.data FROM body_jobs j JOIN messages m ON m.id=j.message_id
+		WHERE j.user_id=? AND j.account_id=? AND j.next_attempt<=? AND j.message_id NOT IN (SELECT message_id FROM pending_moves)
+		ORDER BY json_extract(m.data,'$.date') DESC LIMIT 1`,
+		userId,
+		id,
+		Date.now()
+	);
+}
+export function hasBodyJobs(userId: string, id: string) {
+	return !!nextBodyJob(userId, id);
+}
+
+export async function downloadBodies(userId: string, id: string, signal: AbortSignal) {
+	if (!hasBodyJobs(userId, id)) return;
+	const { data, credentials, version } = await serialized(userId, async () => {
+		const result = await authorizedAccount(userId, id);
+		return {
+			...result,
+			version: one<{ secret: string }>(
+				'SELECT secret FROM accounts WHERE id=? AND user_id=?',
+				id,
+				userId
+			)!.secret
+		};
+	});
+	signal.throwIfAborted();
+	const client = imap(data, credentials);
+	const abort = () => client.close();
+	signal.addEventListener('abort', abort, { once: true });
+	try {
+		await client.connect();
+		for (let count = 0; count < 25; count++) {
+			signal.throwIfAborted();
+			const owner = one<{ secret: string; data: string }>(
+				'SELECT secret,data FROM accounts WHERE id=? AND user_id=?',
+				id,
+				userId
+			);
+			if (!owner || owner.secret !== version || JSON.parse(owner.data).reconnectRequired) break;
+			const job = nextBodyJob(userId, id);
+			if (!job) break;
+			const original: Message = JSON.parse(job.data);
+			let body: Pick<Message, 'text' | 'html' | 'attachments'> | undefined;
+			if (original.html === undefined) {
+				const lock = await client.getMailboxLock(original.path);
+				try {
+					if (client.mailbox && client.mailbox.uidValidity.toString() === original.uidValidity) {
+						const metadata = job.size
+							? undefined
+							: await client.fetchOne(original.uid, { size: true }, { uid: true });
+						const size = job.size || (metadata && metadata.size) || 0;
+						if (size > 20 * 1024 * 1024)
+							body = {
+								text: 'This message is larger than 20 MB — open it in your provider’s client',
+								html: null,
+								attachments: []
+							};
+						else {
+							const source = await client.fetchOne(original.uid, { source: true }, { uid: true });
+							if (source && source.source) body = await parseMessageBody(source.source);
+						}
+					}
+				} finally {
+					lock.release();
+				}
+			}
+			signal.throwIfAborted();
+			db.transaction(() => {
+				const account = one<{ secret: string; data: string }>(
+					'SELECT secret,data FROM accounts WHERE id=? AND user_id=?',
+					id,
+					userId
+				);
+				if (!account || account.secret !== version || JSON.parse(account.data).reconnectRequired)
+					return;
+				const row = one<{ data: string }>(
+					'SELECT data FROM messages WHERE id=? AND user_id=?',
+					job.message_id,
+					userId
+				);
+				if (
+					row &&
+					body &&
+					!one('SELECT message_id FROM pending_moves WHERE message_id=?', job.message_id)
+				) {
+					const current: Message = JSON.parse(row.data);
+					if (current.html === undefined) {
+						db.query('UPDATE messages SET data=? WHERE id=? AND user_id=?').run(
+							JSON.stringify({ ...current, ...body }),
+							current.id,
+							userId
+						);
+						bump(userId);
+					}
+				}
+				db.query('DELETE FROM body_jobs WHERE message_id=? AND user_id=?').run(
+					job.message_id,
+					userId
+				);
+			})();
+		}
+	} catch (error) {
+		const owner = one<{ secret: string }>(
+			'SELECT secret FROM accounts WHERE id=? AND user_id=?',
+			id,
+			userId
+		);
+		if (!signal.aborted && owner?.secret === version) recordAuthFailure(userId, id, error);
+		throw error;
+	} finally {
+		try {
+			if (signal.aborted) client.close();
+			else await client.logout().catch(() => client.close());
+		} finally {
+			signal.removeEventListener('abort', abort);
+		}
 	}
 }
 
@@ -327,7 +530,6 @@ export async function syncInbox(userId: string, id: string, client: ImapFlow) {
 export async function syncAccount(userId: string, id: string) {
 	const { data, credentials } = await authorizedAccount(userId, id);
 	const client = imap(data, credentials);
-	const messages: Message[] = [];
 	try {
 		await connectImap(client, userId, data.id);
 		const folders = (await client.list()).filter(
@@ -338,24 +540,35 @@ export async function syncAccount(userId: string, id: string) {
 			(a, b) => Number(b.path.toUpperCase() === 'INBOX') - Number(a.path.toUpperCase() === 'INBOX')
 		);
 		for (const folder of folders) {
-			messages.push(
-				...(await syncFolder(
-					userId,
-					id,
-					client,
-					folder.path,
-					folder.path.toUpperCase() === 'INBOX' ? 'inbox' : special[folder.specialUse!]
-				))
+			await syncFolder(
+				userId,
+				id,
+				client,
+				folder.path,
+				folder.path.toUpperCase() === 'INBOX' ? 'inbox' : special[folder.specialUse!]
 			);
 		}
-		data.lastSync = now();
-		if (!data.reconnectRequired) data.error = null;
 		db.transaction(() => {
-			db.query('DELETE FROM messages WHERE account_id=? AND user_id=?').run(id, userId);
-			const insert = db.query('INSERT INTO messages VALUES (?,?,?,?)');
-			for (const message of messages) insert.run(message.id, userId, id, JSON.stringify(message));
+			const latest = one<{ data: string }>(
+				'SELECT data FROM accounts WHERE id=? AND user_id=?',
+				id,
+				userId
+			);
+			if (!latest) return;
+			const current: MailAccount = JSON.parse(latest.data);
+			current.lastSync = now();
+			if (!current.reconnectRequired) current.error = null;
+			const paths = new Set(folders.map((folder) => folder.path));
+			for (const row of all<{ id: string; data: string }>(
+				'SELECT id,data FROM messages WHERE account_id=? AND user_id=?',
+				id,
+				userId
+			)) {
+				if (!paths.has(JSON.parse(row.data).path))
+					db.query('DELETE FROM messages WHERE id=? AND user_id=?').run(row.id, userId);
+			}
 			db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
-				JSON.stringify(data),
+				JSON.stringify(current),
 				id,
 				userId
 			);
@@ -365,8 +578,16 @@ export async function syncAccount(userId: string, id: string) {
 		if (isMailAuthError(error)) throw new MailAuthError();
 		data.error = 'Could not sync this account — check your connection or reconnect the account';
 		db.transaction(() => {
+			const latest = one<{ data: string }>(
+				'SELECT data FROM accounts WHERE id=? AND user_id=?',
+				id,
+				userId
+			);
+			if (!latest) return;
+			const current: MailAccount = JSON.parse(latest.data);
+			if (!current.reconnectRequired) current.error = data.error;
 			db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
-				JSON.stringify(data),
+				JSON.stringify(current),
 				id,
 				userId
 			);
@@ -516,15 +737,32 @@ export async function updateMessage(
 			lock.release();
 		}
 		db.transaction(() => {
+			const latest = one<{ data: string }>(
+				'SELECT data FROM messages WHERE id=? AND user_id=?',
+				id,
+				userId
+			);
+			const current: Message = latest ? JSON.parse(latest.data) : mail;
 			if (target && target !== mail.path) {
 				db.query('DELETE FROM messages WHERE id=? AND user_id=?').run(id, userId);
-				if (moved)
+				if (moved) {
+					moved = {
+						...moved,
+						text: current.text,
+						html: current.html,
+						attachments: current.attachments
+					};
 					db.query(
 						'INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data'
 					).run(moved.id, userId, moved.accountId, JSON.stringify(moved));
+					if (moved.html === undefined)
+						db.query(
+							'INSERT OR IGNORE INTO body_jobs (message_id,user_id,account_id,size) VALUES (?,?,?,0)'
+						).run(moved.id, userId, moved.accountId);
+				}
 			} else
 				db.query('UPDATE messages SET data=? WHERE id=? AND user_id=?').run(
-					JSON.stringify({ ...mail, ...change }),
+					JSON.stringify({ ...current, ...change }),
 					id,
 					userId
 				);

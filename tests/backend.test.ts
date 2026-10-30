@@ -914,73 +914,271 @@ describe('Inbox notification latency', () => {
 		};
 	}
 
-	test('publishes the inbox over SSE before a slow body download completes, preserving other folders', async () => {
+	function bodyMocks(fetch: (...args: any[]) => Promise<any>) {
+		return import('imapflow').then(({ ImapFlow }) => {
+			const data = { ...snapshot('alice').accounts[0], imapHost: 'imap.mail.me.com' };
+			db.query('UPDATE accounts SET data=?,secret=? WHERE id=?').run(
+				JSON.stringify(data),
+				encrypt(JSON.stringify({ username: data.email, password: 'test' }), 'alice:account-alice'),
+				data.id
+			);
+			const mocks = [
+				spyOn(ImapFlow.prototype, 'connect').mockResolvedValue(undefined),
+				spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined),
+				spyOn(ImapFlow.prototype, 'getMailboxLock').mockImplementation(async function (
+					this: InstanceType<typeof ImapFlow>
+				) {
+					this.mailbox = { exists: 1, uidValidity: 1n } as never;
+					return { release() {} } as never;
+				}),
+				spyOn(ImapFlow.prototype, 'fetchOne').mockImplementation(fetch)
+			];
+			return { source: mocks[3], restore: () => mocks.forEach((mock) => mock.mockRestore()) };
+		});
+	}
+	const rawBody = {
+		source: Buffer.from(
+			'From: friend@example.com\r\nContent-Type: text/plain\r\n\r\nDownloaded body'
+		)
+	};
+	async function until(condition: () => boolean) {
+		for (let attempt = 0; !condition() && attempt < 200; attempt++) await Bun.sleep(2);
+		expect(condition()).toBe(true);
+	}
+
+	test('a blocked body download never delays the next inbox arrival or a flag change', async () => {
 		const state = await fixture();
-		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
-			'sent-copy',
-			'alice',
-			'account-alice',
-			JSON.stringify({ id: 'sent-copy', folder: 'sent', path: 'Sent', accountId: 'account-alice' })
-		);
-		let download!: (result: never) => void;
-		const source = spyOn(state.client, 'fetchOne').mockImplementation(
-			() =>
-				new Promise<never>((resolve) => {
-					download = resolve;
-				})
-		);
-		const reader = (await GET(event('events'))).body!.getReader();
-		await reader.read();
-		const notification = reader.read();
-		const job = state.syncInbox('alice', 'account-alice', state.client);
+		const idleSource = spyOn(state.client, 'fetchOne');
+		let release!: (value: never) => void;
+		let first = true;
+		const bodies = await bodyMocks(async () => {
+			if (first) {
+				first = false;
+				return new Promise<never>((resolve) => {
+					release = resolve;
+				});
+			}
+			return rawBody;
+		});
+		const { downloadBodies, serialized } = await import('../src/lib/server/mail');
+		let job: Promise<void> | undefined;
 		try {
-			const update = new TextDecoder().decode((await notification).value);
-			expect(update).toContain('event: revision');
-			const inbox = snapshot('alice').messages.find((message) => message.folder === 'inbox')!;
-			expect(inbox.subject).toBe('Arrived now');
-			expect(inbox.html).toBeUndefined();
-			expect(snapshot('alice').messages.some((message) => message.id === 'sent-copy')).toBe(true);
-			expect(state.client.connect).not.toHaveBeenCalled();
-			expect(state.client.list).not.toHaveBeenCalled();
-			const revision = snapshot('alice').revision;
-			// The UI already has the message while the download remains blocked
-			expect(download).toBeDefined();
-			download({
-				source: Buffer.from(
-					'From: friend@example.com\r\nContent-Type: text/plain\r\n\r\nDownloaded body'
-				)
-			} as never);
+			await state.syncInbox('alice', 'account-alice', state.client);
+			job = downloadBodies('alice', 'account-alice', new AbortController().signal);
+			await until(() => !!release);
+			const reader = (await GET(event('events'))).body!.getReader();
+			await reader.read();
+			const notification = reader.read();
+			state.headers[0].flags.add('\\Seen');
+			state.headers.push({
+				...state.headers[0],
+				uid: 8,
+				flags: new Set(),
+				envelope: { ...state.headers[0].envelope, subject: 'Second arrival' }
+			});
+			state.client.mailbox = { exists: 2, uidValidity: 1n } as never;
+			// Metadata uses the regular mutation lock while body I/O is still blocked
+			await serialized('alice', () => state.syncInbox('alice', 'account-alice', state.client));
+			expect(new TextDecoder().decode((await notification).value)).toContain('event: revision');
+			await reader.cancel();
+			expect(snapshot('alice').messages.find((message) => message.uid === 8)?.subject).toBe(
+				'Second arrival'
+			);
+			expect(snapshot('alice').messages.find((message) => message.uid === 7)?.read).toBe(true);
+			expect(idleSource).not.toHaveBeenCalled();
+			release(rawBody as never);
 			await job;
-			expect(snapshot('alice').messages.find((message) => message.id === inbox.id)?.text).toContain(
+			expect(snapshot('alice').messages.find((message) => message.uid === 7)?.text).toContain(
 				'Downloaded body'
 			);
-			expect(snapshot('alice').revision).toBeGreaterThan(revision);
-			expect(state.client.logout).not.toHaveBeenCalled();
+			expect(snapshot('alice').messages.find((message) => message.uid === 7)?.read).toBe(true);
+			expect(one('SELECT message_id FROM body_jobs')).toBeNull();
 		} finally {
-			await reader.cancel();
-			source.mockRestore();
+			release?.(rawBody as never);
+			await job;
+			idleSource.mockRestore();
+			bodies.restore();
 			state.restore();
 		}
 	});
 
-	test('reuses cached bodies and reflects flag changes and an emptied inbox', async () => {
+	test('fetches envelopes only for uncached UIDs and retains cached bodies', async () => {
 		const state = await fixture();
-		const source = spyOn(state.client, 'fetchOne').mockResolvedValue({
-			source: Buffer.from('From: friend@example.com\r\nContent-Type: text/plain\r\n\r\nCached body')
-		} as never);
+		const bodies = await bodyMocks(async () => rawBody);
+		const { downloadBodies } = await import('../src/lib/server/mail');
 		try {
 			await state.syncInbox('alice', 'account-alice', state.client);
+			await downloadBodies('alice', 'account-alice', new AbortController().signal);
 			state.headers[0].flags.add('\\Seen');
 			await state.syncInbox('alice', 'account-alice', state.client);
-			expect(source).toHaveBeenCalledTimes(1);
+			const calls = (state.client.fetchAll as any).mock.calls;
+			expect(calls.filter((call: any[]) => call[1].envelope)).toHaveLength(1);
+			expect(calls.find((call: any[]) => call[1].envelope)[0]).toEqual([7]);
+			expect(bodies.source).toHaveBeenCalledTimes(1);
 			expect(snapshot('alice').messages[0].read).toBe(true);
-			expect(snapshot('alice').messages[0].text).toContain('Cached body');
+			expect(snapshot('alice').messages[0].text).toContain('Downloaded body');
 			state.client.mailbox = { exists: 0, uidValidity: 1n } as never;
 			await state.syncInbox('alice', 'account-alice', state.client);
 			expect(snapshot('alice').messages).toEqual([]);
 		} finally {
-			source.mockRestore();
+			bodies.restore();
 			state.restore();
+		}
+	});
+
+	test('uses CONDSTORE watermarks for flag deltas and resets on UIDVALIDITY changes', async () => {
+		const state = await fixture();
+		state.client.enabled.add('CONDSTORE');
+		state.client.mailbox = { exists: 1, uidValidity: 1n, highestModseq: 10n } as never;
+		try {
+			await state.syncInbox('alice', 'account-alice', state.client);
+			state.headers[0].flags.add('\\Seen');
+			state.client.mailbox = { exists: 1, uidValidity: 1n, highestModseq: 12n } as never;
+			await state.syncInbox('alice', 'account-alice', state.client);
+			expect(
+				(state.client.fetchAll as any).mock.calls.some(
+					(call: any[]) => call[2]?.changedSince === 10n
+				)
+			).toBe(true);
+			expect(snapshot('alice').messages[0].read).toBe(true);
+			state.client.mailbox = { exists: 1, uidValidity: 2n, highestModseq: 1n } as never;
+			await state.syncInbox('alice', 'account-alice', state.client);
+			expect(snapshot('alice').messages).toHaveLength(1);
+			expect(snapshot('alice').messages[0].uidValidity).toBe('2');
+			expect(
+				(state.client.fetchAll as any).mock.calls.filter((call: any[]) => call[1].envelope)
+			).toHaveLength(2);
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('a failed delta does not advance the watermark, and NOMODSEQ falls back to flags', async () => {
+		const state = await fixture();
+		state.client.enabled.add('CONDSTORE');
+		state.client.mailbox = { exists: 1, uidValidity: 1n, highestModseq: 10n } as never;
+		try {
+			await state.syncInbox('alice', 'account-alice', state.client);
+			state.client.mailbox = { exists: 1, uidValidity: 1n, highestModseq: 12n } as never;
+			let fail = true;
+			(state.client.fetchAll as any).mockImplementation(
+				async (_range: unknown, _query: unknown, options: { changedSince?: bigint } = {}) => {
+					if (options.changedSince && fail) {
+						fail = false;
+						throw new Error('Connection interrupted');
+					}
+					return state.headers;
+				}
+			);
+			await expect(state.syncInbox('alice', 'account-alice', state.client)).rejects.toThrow(
+				'interrupted'
+			);
+			state.headers[0].flags.add('\\Seen');
+			await state.syncInbox('alice', 'account-alice', state.client);
+			const deltas = (state.client.fetchAll as any).mock.calls.filter(
+				(call: any[]) => call[2]?.changedSince
+			);
+			expect(deltas.map((call: any[]) => call[2].changedSince)).toEqual([10n, 10n]);
+			expect(snapshot('alice').messages[0].read).toBe(true);
+			state.client.mailbox = { exists: 1, uidValidity: 1n, noModseq: true } as never;
+			await state.syncInbox('alice', 'account-alice', state.client);
+			expect((state.client.fetchAll as any).mock.calls.at(-1)[1].flags).toBe(true);
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('failed body downloads stay queued and deleting a message removes its pending work', async () => {
+		const state = await fixture();
+		const bodies = await bodyMocks(async () => {
+			throw new Error('Temporary outage');
+		});
+		const { downloadBodies, hasBodyJobs } = await import('../src/lib/server/mail');
+		try {
+			await state.syncInbox('alice', 'account-alice', state.client);
+			await expect(
+				downloadBodies('alice', 'account-alice', new AbortController().signal)
+			).rejects.toThrow('Temporary outage');
+			expect(hasBodyJobs('alice', 'account-alice')).toBe(true);
+			expect(snapshot('alice').messages[0].html).toBeUndefined();
+			db.query('DELETE FROM messages WHERE user_id=?').run('alice');
+			expect(one('SELECT message_id FROM body_jobs')).toBeNull();
+		} finally {
+			bodies.restore();
+			state.restore();
+		}
+	});
+
+	test('a flag mutation finishing after a body download preserves the downloaded content', async () => {
+		const state = await fixture();
+		let releaseBody!: (value: never) => void;
+		let releaseFlags!: () => void;
+		const bodies = await bodyMocks(
+			() =>
+				new Promise<never>((resolve) => {
+					releaseBody = resolve;
+				})
+		);
+		const { ImapFlow } = await import('imapflow');
+		const flags = spyOn(ImapFlow.prototype, 'messageFlagsAdd').mockImplementation(
+			() =>
+				new Promise<true>((resolve) => {
+					releaseFlags = () => resolve(true);
+				})
+		);
+		const { downloadBodies, updateMessage } = await import('../src/lib/server/mail');
+		await state.syncInbox('alice', 'account-alice', state.client);
+		const bodyJob = downloadBodies('alice', 'account-alice', new AbortController().signal);
+		let mutation: Promise<void> | undefined;
+		try {
+			await until(() => !!releaseBody);
+			mutation = updateMessage('alice', snapshot('alice').messages[0].id, { read: true });
+			await until(() => !!releaseFlags);
+			releaseBody(rawBody as never);
+			await bodyJob;
+			releaseFlags();
+			await mutation;
+			expect(snapshot('alice').messages[0].read).toBe(true);
+			expect(snapshot('alice').messages[0].text).toContain('Downloaded body');
+		} finally {
+			releaseBody?.(rawBody as never);
+			releaseFlags?.();
+			await bodyJob;
+			await mutation;
+			flags.mockRestore();
+			bodies.restore();
+			state.restore();
+		}
+	});
+
+	test('body completion cannot restore deleted mail or write after credentials are replaced', async () => {
+		for (const action of ['delete', 'reconnect']) {
+			const state = await fixture();
+			let release!: (value: never) => void;
+			const bodies = await bodyMocks(
+				() =>
+					new Promise<never>((resolve) => {
+						release = resolve;
+					})
+			);
+			const { downloadBodies } = await import('../src/lib/server/mail');
+			await state.syncInbox('alice', 'account-alice', state.client);
+			const job = downloadBodies('alice', 'account-alice', new AbortController().signal);
+			try {
+				await until(() => !!release);
+				if (action === 'delete') db.query('DELETE FROM messages WHERE user_id=?').run('alice');
+				else
+					db.query('UPDATE accounts SET secret=? WHERE id=?').run('replacement', 'account-alice');
+				release(rawBody as never);
+				await job;
+				if (action === 'delete') expect(snapshot('alice').messages).toEqual([]);
+				else expect(snapshot('alice').messages[0].html).toBeUndefined();
+			} finally {
+				release?.(rawBody as never);
+				await job;
+				bodies.restore();
+				state.restore();
+			}
 		}
 	});
 });

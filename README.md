@@ -93,6 +93,8 @@ The Sent, Archive, and Trash folders must advertise their IMAP special-use flags
 - Signed-in web clients receive revision notifications through authenticated Server-Sent Events and fetch fresh state when it changes
 - The server maintains one IMAP IDLE connection per connected account’s inbox, even with no browser open — new messages, flag changes, and deletions trigger a debounced inbox sync over the existing connection
 - Message headers are published before body downloads finish — the reader shows a loading message until content arrives
+- Bodies download on separate IMAP connections through a persistent SQLite queue, with at most two accounts downloading concurrently — pending downloads resume after a server restart and retry transient failures with backoff
+- Sync fetches lightweight UID membership and flag data, then envelopes only for uncached messages — CONDSTORE-capable servers use modification watermarks for flag deltas, with a regular flag-fetch fallback when unsupported
 - All supported folders reconcile every 10 minutes and after IMAP reconnects — changes outside the inbox may wait for reconciliation or manual refresh
 - IMAP connections retry with exponential backoff from 1 to 60 seconds — accounts requiring authentication reconnect stay paused until credentials are replaced
 - Browsers fetch the latest revision on SSE reconnect, focus, and every 10 minutes, with a 1-minute state polling fallback while the stream is disconnected
@@ -101,7 +103,7 @@ The Sent, Archive, and Trash folders must advertise their IMAP special-use flags
 - Search covers this cached window, not the provider’s full mailbox
 - Draft saves use optimistic concurrency based on the original `updatedAt` value — stale edits return `409` and remain open in the composer
 - Attachments are sent immediately or downloaded on demand — unsent attachments stay on the composing device and are not part of saved drafts
-- Operations for a workspace are serialized inside one Bun process — deploy one application replica with a persistent database volume
+- Mailbox metadata and mutations for a workspace are serialized inside one Bun process — body downloads run independently and merge content into the latest message state — deploy one application replica with a persistent database volume
 - There is no offline compose persistence, full mailbox pagination, or browser push notification delivery in this version — SSE updates open clients only
 
 ## Storage and deployment

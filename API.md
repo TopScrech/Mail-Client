@@ -46,6 +46,10 @@ Registration never creates a user — Apple signup must happen first
 
 `Snapshot` contains `revision`, `accounts`, `messages`, and `drafts` — the canonical TypeScript wire shapes are in `src/lib/types.ts`
 
+Mailbox sync publishes metadata and queues body downloads separately — a message may initially omit `html` while content is pending, and a later revision supplies its body and attachments — `html: null` marks a loaded plain-text message
+
+Body downloads use separate IMAP connections and a persistent queue — retries survive restarts, and completed downloads merge only content fields so newer flags and moves are preserved
+
 Account responses never include passwords — passwords can only be supplied through the connect and reconnect endpoints
 
 Accounts with rejected mail credentials report `reconnectRequired: true` and a reconnect suggestion in `error` — reconnect with the same provider and email to restore access
