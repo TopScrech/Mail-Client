@@ -6,3 +6,10 @@ build
 data
 .git
 work
+tests
+*.md
+coverage
+*.log
+.DS_Store
+.idea
+.vscode

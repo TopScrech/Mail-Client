@@ -9,6 +9,19 @@ Create an application from `TopScrech/Mail-Client`, branch `main`, using the **D
 - Persistent storage: a named volume mounted at `/app/data`, writable by the container’s `bun` user
 - Run one application replica — the database is SQLite and mailbox operations are coordinated within one process
 
+## Build caching and rollout time
+
+The Dockerfile caches dependency installation separately from application sources and copies only build inputs into the build stage
+Documentation and test changes do not invalidate the application build layer
+Keep BuildKit caches between deployments to reuse those layers
+
+`NODE_ENV` is already set to `production` in the runtime image — leave any Coolify override runtime-only
+The dependency install explicitly uses `NODE_ENV=development` so build tools remain available
+
+Image build time and rolling-update time are separate in Coolify's deployment log
+The server retains its default 30-second graceful shutdown timeout so active requests can finish
+Long-lived event streams may keep the old container alive during that window — a faster image build does not shorten that wait
+
 ## Environment variables
 
 Set these as **runtime** variables — Apple keys and mail encryption keys are not needed during the Docker build
