@@ -5,6 +5,7 @@ import { all, db, one } from './db';
 import { assert } from './config';
 import type { Session } from './auth';
 import type { Message } from '$lib/types';
+import { websiteIconDomains } from './sender-icons';
 
 export function pushCredentials() {
 	return {
@@ -139,6 +140,7 @@ export function notificationPayload(message: Message) {
 	return {
 		aps: {
 			category: 'MAIL_MESSAGE',
+			'mutable-content': 1,
 			alert: {
 				title: notificationSender(message).slice(0, 160),
 				body: message.subject.slice(0, 240)
@@ -146,7 +148,12 @@ export function notificationPayload(message: Message) {
 			sound: 'default',
 			'thread-id': message.accountId
 		},
-		messageId: message.id
+		messageId: message.id,
+		sender: {
+			name: notificationSender(message).slice(0, 160),
+			address: message.fromAddress.trim().slice(0, 320),
+			websiteIconDomains: websiteIconDomains(message.fromAddress)
+		}
 	};
 }
 

@@ -1312,6 +1312,22 @@ describe('Push notifications', () => {
 		expect(payload.messageId).not.toBe(mail.messageId);
 		expect(payload.aps.alert).toEqual({ title: 'Sender', body: 'New mail' });
 	});
+	test('mail alerts enable avatar enrichment with bounded sender details', async () => {
+		const { notificationPayload } = await import('../src/lib/server/push');
+		const mail = { ...message(1), fromAddress: 'person@news.apple.com' };
+		const payload = notificationPayload(mail);
+		expect(payload.aps['mutable-content']).toBe(1);
+		expect(payload.sender).toEqual({
+			name: 'Sender',
+			address: 'person@news.apple.com',
+			websiteIconDomains: ['news.apple.com', 'apple.com']
+		});
+		expect(
+			notificationPayload({ ...mail, fromAddress: 'person@gmail.com' }).sender.websiteIconDomains
+		).toEqual([]);
+		expect(notificationPayload({ ...mail, from: 'a'.repeat(1000) }).sender.name.length).toBe(160);
+		expect(Buffer.byteLength(JSON.stringify(payload))).toBeLessThan(4096);
+	});
 	test('registration requires authentication and validates tokens and environments', async () => {
 		await setup();
 		expect((await PUT(event('push/devices', 'PUT', input, null))).status).toBe(401);

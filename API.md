@@ -105,6 +105,8 @@ An SMTP acceptance can return a `warning` if some recipients were rejected or sa
 ## Native push notifications
 
 Mail alerts include `aps.category: "MAIL_MESSAGE"` and a top-level `messageId` containing the server message ID
+Alerts also include `aps.mutable-content: 1` and a `sender` object with `name`, `address`, and `websiteIconDomains` so the native notification service extension can show the sender avatar through communication notifications
+Avatar lookup runs on the device with no persistent notification image cache and falls back to sender initials when artwork is unavailable
 The native app registers a destructive Delete action for that category and sends `PATCH /api/v1/messages` with `{"id":"<messageId>","folder":"trash"}` without marking the message read
 
 Authenticated `PUT /api/v1/push/devices` registers or refreshes an APNs installation
