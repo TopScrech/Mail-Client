@@ -104,6 +104,9 @@ An SMTP acceptance can return a `warning` if some recipients were rejected or sa
 
 ## Native push notifications
 
+Mail alerts include `aps.category: "MAIL_MESSAGE"` and a top-level `messageId` containing the server message ID
+The native app registers a destructive Delete action for that category and sends `PATCH /api/v1/messages` with `{"id":"<messageId>","folder":"trash"}` without marking the message read
+
 Authenticated `PUT /api/v1/push/devices` registers or refreshes an APNs installation
 
 ```json

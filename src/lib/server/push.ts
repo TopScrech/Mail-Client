@@ -128,8 +128,26 @@ function notificationSender(message: Message): string {
 	const displayName = name.match(/^"?([^<]+?)"?\s*<[^>]+>$/)?.[1]?.trim();
 	if (displayName && !displayName.includes('@')) return displayName;
 	const address = message.fromAddress.trim() || name;
-	const localPart = address.split('@')[0].replace(/[._-]+/g, ' ').trim();
+	const localPart = address
+		.split('@')[0]
+		.replace(/[._-]+/g, ' ')
+		.trim();
 	return localPart || 'Unknown sender';
+}
+
+export function notificationPayload(message: Message) {
+	return {
+		aps: {
+			category: 'MAIL_MESSAGE',
+			alert: {
+				title: notificationSender(message).slice(0, 160),
+				body: message.subject.slice(0, 240)
+			},
+			sound: 'default',
+			'thread-id': message.accountId
+		},
+		messageId: message.id
+	};
 }
 
 export async function sendPush(job: PushJob): Promise<PushResult> {
@@ -144,14 +162,7 @@ export async function sendPush(job: PushJob): Promise<PushResult> {
 	)
 		return { status: 200 };
 	const message: Message = JSON.parse(job.data);
-	const payload = JSON.stringify({
-		aps: {
-			alert: { title: notificationSender(message).slice(0, 160), body: message.subject.slice(0, 240) },
-			sound: 'default',
-			'thread-id': message.accountId
-		},
-		messageId: message.id
-	});
+	const payload = JSON.stringify(notificationPayload(message));
 	return new Promise((resolve, reject) => {
 		const client = connect(
 			job.environment === 'production'

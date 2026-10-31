@@ -1303,6 +1303,15 @@ describe('Push notifications', () => {
 		);
 		return mail;
 	}
+	test('mail alerts expose Delete and identify the server message rather than the email header', async () => {
+		const { notificationPayload } = await import('../src/lib/server/push');
+		const mail = message(1);
+		const payload = notificationPayload(mail);
+		expect(payload.aps.category).toBe('MAIL_MESSAGE');
+		expect(payload.messageId).toBe(mail.id);
+		expect(payload.messageId).not.toBe(mail.messageId);
+		expect(payload.aps.alert).toEqual({ title: 'Sender', body: 'New mail' });
+	});
 	test('registration requires authentication and validates tokens and environments', async () => {
 		await setup();
 		expect((await PUT(event('push/devices', 'PUT', input, null))).status).toBe(401);
