@@ -121,6 +121,17 @@ export interface PushResult {
 	reason?: string;
 	timestamp?: number;
 }
+function notificationSender(message: Message): string {
+	const name = message.from.trim();
+	if (name && !name.includes('@')) return name;
+	// Some senders include the mailbox in their display name
+	const displayName = name.match(/^"?([^<]+?)"?\s*<[^>]+>$/)?.[1]?.trim();
+	if (displayName && !displayName.includes('@')) return displayName;
+	const address = message.fromAddress.trim() || name;
+	const localPart = address.split('@')[0].replace(/[._-]+/g, ' ').trim();
+	return localPart || 'Unknown sender';
+}
+
 export async function sendPush(job: PushJob): Promise<PushResult> {
 	const auth = await authorization();
 	if (
@@ -135,7 +146,7 @@ export async function sendPush(job: PushJob): Promise<PushResult> {
 	const message: Message = JSON.parse(job.data);
 	const payload = JSON.stringify({
 		aps: {
-			alert: { title: message.from.slice(0, 160), body: message.subject.slice(0, 240) },
+			alert: { title: notificationSender(message).slice(0, 160), body: message.subject.slice(0, 240) },
 			sound: 'default',
 			'thread-id': message.accountId
 		},
