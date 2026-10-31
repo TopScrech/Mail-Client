@@ -199,3 +199,29 @@ See [Microsoft mail OAuth](https://learn.microsoft.com/en-us/exchange/client-dev
 
 For local testing, register the corresponding `http://localhost:5173/api/v1/mail/oauth/<provider>/callback` URI on a development OAuth client
 Never expose client secrets or tokens to the browser or commit them to Git
+
+## Apple push notifications
+
+The backend reuses `APPLE_TEAM_ID`, `APPLE_KEY_ID`, and `APPLE_PRIVATE_KEY` for APNs
+Enable APNs on that existing Sign in with Apple key, then add this runtime variable and redeploy
+
+```env
+APNS_TOPIC=dev.topscrech.Mail-Otter
+```
+
+Optional nonempty `APNS_TEAM_ID`, `APNS_KEY_ID`, and `APNS_PRIVATE_KEY` values override their matching `APPLE_*` values when using a separate key
+Private keys accept real newlines or literal `\n` separators
+Enable Push Notifications for the app identifier
+Use a key permitted for the required sandbox and production environments
+The server selects the APNs endpoint per registered device, so there is no global environment variable
+Allow outbound HTTPS/HTTP2 to `api.push.apple.com` and `api.sandbox.push.apple.com`
+Keep the existing SQLite volume persistent and run the backend continuously for IMAP watching and queue delivery
+
+The app requests alert and sound permission after sign-in and refreshes registration when it becomes active
+Settings shows registration errors and offers a retry button
+The app detects the APNs environment from its provisioning profile on iOS/visionOS and its signed entitlement on macOS
+Development-signed Release builds use sandbox automatically, while TestFlight and App Store installations use production
+Regenerate signing profiles with Push Notifications enabled, install the app, sign in, allow notifications, then send a new message to a connected inbox
+Tapping an alert refreshes mail and opens its message
+Existing mail on the first sync is intentionally silent
+Delivery is retried for up to one hour; APNs delivery remains best effort and retries after ambiguous transport failures may repeat an alert

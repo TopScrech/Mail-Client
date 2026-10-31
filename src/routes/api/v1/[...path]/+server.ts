@@ -1,3 +1,4 @@
+import { registerPushDevice, unregisterPushDevice } from '$lib/server/push';
 import {
 	mailProvider,
 	oauthConfigured,
@@ -68,6 +69,14 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return json(await passkeyVerify(event, false, await body(event)));
 	const auth = requireSession(event);
 	const uid = auth.user_id;
+	if (path === 'push/devices' && method === 'PUT') {
+		limit(`push:${uid}`, 60);
+		return json(registerPushDevice(auth, await body(event)));
+	}
+	if (path === 'push/devices' && method === 'DELETE') {
+		unregisterPushDevice(auth, await body(event));
+		return json({ ok: true });
+	}
 	if (path === 'events' && method === 'GET') return eventStream(event, auth);
 	if (path === 'sync' && method === 'GET') void processPendingMoves(uid).catch(() => {});
 	if (path.startsWith('mail/oauth/') && method === 'GET') {

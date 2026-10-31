@@ -1,3 +1,4 @@
+import { queueInboxPushes } from './push';
 import { ImapFlow, type FetchMessageObject } from 'imapflow';
 import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
@@ -360,6 +361,7 @@ async function syncFolder(
 						'INSERT OR IGNORE INTO body_jobs (message_id,user_id,account_id,size) VALUES (?,?,?,?)'
 					).run(message.id, userId, id, newHeaders.get(message.uid)?.size || 0);
 			}
+			if (folder === 'inbox') queueInboxPushes(userId, id, uidValidity, messages);
 			if (dirty) bump(userId);
 		})();
 		// Store the starting watermark, never a later value that could skip an in-flight change

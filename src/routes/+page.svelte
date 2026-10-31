@@ -102,7 +102,7 @@
 		restoredSelectionKey = selectionKey;
 	}
 	$effect(() => {
-		if (!selectionKey || restoredSelectionKey !== selectionKey) return;
+		if (!selectionKey || restoredSelectionKey !== selectionKey || mailbox.revision < 0) return;
 		const selection = JSON.stringify({ selected, selectedAccount, folder, query, mobileReading });
 		try {
 			localStorage.setItem(selectionKey, selection);
@@ -129,7 +129,9 @@
 		}
 	}
 	async function loadProfile() {
-		profile = await api<Profile>('me');
+		const next = await api<Profile>('me');
+		if (profile?.id !== next.id) restoredSelectionKey = '';
+		profile = next;
 	}
 	let pulling = false;
 	let pullAgain = false;
@@ -166,14 +168,14 @@
 			const next = await api<Snapshot | null>(`sync?since=${mailbox.revision}`);
 			if (profile?.id !== userId) return;
 			if (next && next.revision > mailbox.revision) {
-				const initialLoad = mailbox.revision === -1;
 				mailbox = next;
-				if (initialLoad) restoreSelection();
+				if (restoredSelectionKey !== selectionKey) restoreSelection();
 			}
 			syncWarning = '';
 		} catch (e) {
 			if (profile?.id !== userId) return;
 			if (e instanceof RequestError && e.status === 401) {
+				restoredSelectionKey = '';
 				profile = null;
 				mailbox = { revision: -1, accounts: [], messages: [], drafts: [] };
 				notice('Your session ended — sign in again');
@@ -197,7 +199,10 @@
 		try {
 			const next = await api<Snapshot & { errors: string[] }>('mail/sync', 'POST', {});
 			if (profile?.id !== userId) return;
-			if (next.revision >= mailbox.revision) mailbox = next;
+			if (next.revision >= mailbox.revision) {
+				mailbox = next;
+				if (restoredSelectionKey !== selectionKey) restoreSelection();
+			}
 			syncWarning = next.errors.length ? next.errors[0] : '';
 		} catch (e) {
 			syncWarning = e instanceof Error ? e.message : 'Mail sync failed';
@@ -231,6 +236,7 @@
 		error = '';
 	}
 	function leavePreview() {
+		restoredSelectionKey = '';
 		demo = false;
 		mailbox = { revision: -1, accounts: [], messages: [], drafts: [] };
 		selected = '';
@@ -430,6 +436,7 @@
 	async function logout() {
 		await action(async () => {
 			await api('auth/logout', 'POST', {});
+			restoredSelectionKey = '';
 			profile = null;
 			settings = false;
 			composer = null;

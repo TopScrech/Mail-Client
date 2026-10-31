@@ -89,3 +89,22 @@ Idempotency records are retained for 7 days — the server cannot guarantee exac
 Attachments: up to 10 files, at most 15 MB combined — entire multipart request at most 16 MB
 
 An SMTP acceptance can return a `warning` if some recipients were rejected or saving a Sent copy failed
+
+## Native push notifications
+
+Authenticated `PUT /api/v1/push/devices` registers or refreshes an APNs installation
+
+```json
+{"token":"hex-encoded APNs device token","environment":"development"}
+```
+
+`environment` accepts `development` or `production` and must match the signed app's APNs entitlement
+The topic is controlled by the server, never by the client
+Returns `{"ok":true}`, or HTTP 503 if APNs credentials are not configured
+Authenticated `DELETE /api/v1/push/devices` accepts the same body and removes only a registration owned by that session
+Logging out, revoking a session, or deleting a user removes the associated device registrations and queued deliveries
+Expired sessions cannot receive pushes
+
+Notifications contain sender, subject, and a `messageId` for navigation, without the message body
+The first inbox sync and UIDVALIDITY changes establish a baseline without sending historical alerts
+Subsequent new unread inbox messages are queued transactionally, with per-device deduplication, retries, and a one-hour expiry

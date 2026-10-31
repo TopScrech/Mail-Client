@@ -1,10 +1,16 @@
 import { building } from '$app/environment';
 import type { Handle, ServerInit } from '@sveltejs/kit';
+import { startPushWorker } from '$lib/server/push';
 import { startMailWorker } from '$lib/server/background';
 
 export const init: ServerInit = () => {
 	if (building) return;
-	const stop = startMailWorker();
+	const stopMail = startMailWorker();
+	const stopPush = startPushWorker();
+	const stop = () => {
+		stopMail();
+		stopPush();
+	};
 	process.once('sveltekit:shutdown', stop);
 	if (import.meta.hot)
 		import.meta.hot.dispose(() => {

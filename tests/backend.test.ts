@@ -1182,3 +1182,166 @@ describe('Inbox notification latency', () => {
 		}
 	});
 });
+
+describe('Push notifications', () => {
+	test('reuses Apple credentials unless nonempty APNs overrides are supplied', async () => {
+		const names = [
+			'APPLE_TEAM_ID',
+			'APPLE_KEY_ID',
+			'APPLE_PRIVATE_KEY',
+			'APNS_TEAM_ID',
+			'APNS_KEY_ID',
+			'APNS_PRIVATE_KEY',
+			'APNS_TOPIC'
+		];
+		const saved = names.map((name) => process.env[name]);
+		try {
+			process.env.APPLE_TEAM_ID = 'apple-team';
+			process.env.APPLE_KEY_ID = 'apple-key';
+			process.env.APPLE_PRIVATE_KEY = 'apple-private-key';
+			process.env.APNS_TEAM_ID = '';
+			delete process.env.APNS_KEY_ID;
+			delete process.env.APNS_PRIVATE_KEY;
+			process.env.APNS_TOPIC = 'dev.topscrech.Mail-Otter';
+			const { pushCredentials, pushConfigured } = await import('../src/lib/server/push');
+			expect(pushCredentials()).toEqual({
+				teamId: 'apple-team',
+				keyId: 'apple-key',
+				privateKey: 'apple-private-key'
+			});
+			expect(pushConfigured()).toBe(true);
+			process.env.APNS_TEAM_ID = 'push-team';
+			process.env.APNS_KEY_ID = 'push-key';
+			process.env.APNS_PRIVATE_KEY = 'push-private-key';
+			expect(pushCredentials()).toEqual({
+				teamId: 'push-team',
+				keyId: 'push-key',
+				privateKey: 'push-private-key'
+			});
+			delete process.env.APNS_TOPIC;
+			expect(pushConfigured()).toBe(false);
+		} finally {
+			names.forEach((name, index) => {
+				if (saved[index] === undefined) delete process.env[name];
+				else process.env[name] = saved[index];
+			});
+		}
+	});
+
+	const token = 'ab'.repeat(32);
+	const input = { token, environment: 'development' };
+	async function setup() {
+		process.env.APNS_TEAM_ID = 'team';
+		process.env.APNS_KEY_ID = 'key';
+		process.env.APNS_PRIVATE_KEY = 'test-key';
+		process.env.APNS_TOPIC = 'dev.topscrech.Mail-Otter';
+		expect((await PUT(event('push/devices', 'PUT', input))).status).toBe(200);
+		return import('../src/lib/server/push');
+	}
+	function message(uid: number, read = false) {
+		return {
+			id: `push-${uid}`,
+			accountId: 'account-alice',
+			folder: 'inbox' as const,
+			uid,
+			uidValidity: '1',
+			path: 'INBOX',
+			from: 'Sender',
+			fromAddress: 'sender@example.com',
+			to: 'alice@example.com',
+			subject: 'New mail',
+			text: '',
+			date: new Date().toISOString(),
+			read,
+			starred: false,
+			messageId: `message-${uid}`,
+			attachments: []
+		};
+	}
+	function save(uid: number, read = false) {
+		const mail = message(uid, read);
+		db.query('INSERT OR REPLACE INTO messages VALUES (?,?,?,?)').run(
+			mail.id,
+			'alice',
+			'account-alice',
+			JSON.stringify(mail)
+		);
+		return mail;
+	}
+	test('registration requires authentication and validates tokens and environments', async () => {
+		await setup();
+		expect((await PUT(event('push/devices', 'PUT', input, null))).status).toBe(401);
+		expect((await PUT(event('push/devices', 'PUT', { ...input, token: 'invalid' }))).status).toBe(
+			400
+		);
+		expect(
+			(await PUT(event('push/devices', 'PUT', { ...input, environment: 'other' }))).status
+		).toBe(400);
+		expect((await DELETE(event('push/devices', 'DELETE', input, 'bob'))).status).toBe(200);
+		expect(one('SELECT id FROM push_devices')).not.toBeNull();
+	});
+	test('initial mail is silent, new unread mail queues once, and UID resets are silent', async () => {
+		const { queueInboxPushes } = await setup();
+		queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+		expect(one('SELECT id FROM push_jobs')).toBeNull();
+		const messages = [message(1), save(2), save(3, true)];
+		queueInboxPushes('alice', 'account-alice', '1', messages);
+		queueInboxPushes('alice', 'account-alice', '1', messages);
+		expect(one<{ count: number }>('SELECT count(*) count FROM push_jobs')?.count).toBe(1);
+		queueInboxPushes('alice', 'account-alice', '2', [save(4)]);
+		expect(one<{ count: number }>('SELECT count(*) count FROM push_jobs')?.count).toBe(1);
+	});
+	test('session changes discard old queued mail and logout removes registrations', async () => {
+		const { queueInboxPushes } = await setup();
+		queueInboxPushes('alice', 'account-alice', '1', []);
+		queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+		expect((await PUT(event('push/devices', 'PUT', input, 'bob'))).status).toBe(200);
+		expect(one('SELECT id FROM push_jobs')).toBeNull();
+		expect(one<{ session_id: string }>('SELECT session_id FROM push_devices')?.session_id).toBe(
+			'session-bob'
+		);
+		await POST(event('auth/logout', 'POST', {}, 'bob'));
+		expect(one('SELECT id FROM push_devices')).toBeNull();
+	});
+	test('transient failure retries and successful delivery clears the job', async () => {
+		const { queueInboxPushes, deliverPushes } = await setup();
+		queueInboxPushes('alice', 'account-alice', '1', []);
+		queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+		await deliverPushes(async () => ({ status: 503, reason: 'ServiceUnavailable' }));
+		expect(one<{ attempts: number }>('SELECT attempts FROM push_jobs')?.attempts).toBe(1);
+		db.query('UPDATE push_jobs SET next_attempt=0').run();
+		await deliverPushes(async () => ({ status: 200 }));
+		expect(one('SELECT id FROM push_jobs')).toBeNull();
+	});
+	test('invalid device tokens are removed', async () => {
+		const { queueInboxPushes, deliverPushes } = await setup();
+		queueInboxPushes('alice', 'account-alice', '1', []);
+		queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+		await deliverPushes(async () => ({ status: 410, reason: 'Unregistered' }));
+		expect(one('SELECT id FROM push_devices')).toBeNull();
+		expect(one('SELECT id FROM push_jobs')).toBeNull();
+	});
+	test('expired sessions and messages read before delivery do not receive alerts', async () => {
+		const { queueInboxPushes, deliverPushes } = await setup();
+		queueInboxPushes('alice', 'account-alice', '1', []);
+		queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+		db.query('UPDATE sessions SET expires=0').run();
+		let sent = 0;
+		await deliverPushes(async () => {
+			sent++;
+			return { status: 200 };
+		});
+		expect(sent).toBe(0);
+		db.query('UPDATE sessions SET expires=?').run(Date.now() + 60000);
+		db.query('UPDATE messages SET data=? WHERE id=?').run(
+			JSON.stringify(message(1, true)),
+			'push-1'
+		);
+		await deliverPushes(async () => {
+			sent++;
+			return { status: 200 };
+		});
+		expect(sent).toBe(0);
+		expect(one('SELECT id FROM push_jobs')).toBeNull();
+	});
+});
