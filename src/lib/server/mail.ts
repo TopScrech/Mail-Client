@@ -1,4 +1,5 @@
 import { queueInboxPushes } from './push';
+import { providerBimiLogo } from './bimi';
 import { ImapFlow, type FetchMessageObject } from 'imapflow';
 import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
@@ -280,7 +281,15 @@ async function syncFolder(
 					...(!canDelta ? { flags: true } : {})
 				})
 			: [];
-		const missing = members.filter((header) => !cached.has(header.uid)).map((header) => header.uid);
+		const missing = members
+			.filter((header) => !cached.has(header.uid) || cached.get(header.uid)?.bimiLogo === undefined)
+			.map((header) => header.uid);
+		const accountRow = one<{ data: string }>(
+			'SELECT data FROM accounts WHERE id=? AND user_id=?',
+			id,
+			userId
+		);
+		const imapHost = accountRow ? (JSON.parse(accountRow.data) as MailAccount).imapHost || '' : '';
 		const envelopes = missing.length
 			? await client.fetchAll(
 					missing,
@@ -288,6 +297,7 @@ async function syncFolder(
 						uid: true,
 						flags: true,
 						envelope: true,
+						headers: true,
 						internalDate: true,
 						size: true
 					},
@@ -313,6 +323,8 @@ async function syncFolder(
 			const old = cached.get(member.uid);
 			if (!old && !header?.envelope) continue;
 			const message = old ? { ...old } : fromHeader(id, path, folder, uidValidity, header!);
+			if (header)
+				message.bimiLogo = await providerBimiLogo(header.headers, imapHost, message.fromAddress);
 			const nextFlags = header?.flags || flags.get(member.uid);
 			if (nextFlags) {
 				message.read = nextFlags.has('\\Seen');

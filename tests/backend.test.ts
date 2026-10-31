@@ -914,6 +914,41 @@ describe('Inbox notification latency', () => {
 		};
 	}
 
+	test('backfills provider artwork once and preserves it through later flag syncs', async () => {
+		const state = await fixture();
+		const { createHash } = await import('node:crypto');
+		const data = { ...snapshot('alice').accounts[0], imapHost: 'imap.gmail.com' };
+		db.query('UPDATE accounts SET data=? WHERE id=?').run(JSON.stringify(data), data.id);
+		const svg =
+			'<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><path fill="red" d="M0 0h100v100H0z"/></svg>';
+		const hash = createHash('sha256').update(svg).digest('hex');
+		const raw = Buffer.from(
+			`From: friend@example.com\r\nAuthentication-Results: mx.google.com; dmarc=pass header.from=example.com; bimi=pass header.d=example.com header.selector=default policy.authority=pass policy.indicator-hash=${hash}\r\nBIMI-Indicator: ${Buffer.from(svg).toString('base64')}\r\n\r\n`
+		);
+		try {
+			await state.syncInbox('alice', 'account-alice', state.client);
+			const old = snapshot('alice').messages.find((message) => message.uid === 7)!;
+			delete old.bimiLogo;
+			db.query('UPDATE messages SET data=? WHERE id=?').run(JSON.stringify(old), old.id);
+			Object.assign(state.headers[0], { headers: raw });
+			await state.syncInbox('alice', 'account-alice', state.client);
+			const logo = snapshot('alice').messages.find((message) => message.uid === 7)!.bimiLogo;
+			expect(logo).toBeString();
+			state.headers[0].flags.add('\\Seen');
+			const fetches = spyOn(state.client, 'fetchAll').mockImplementation(async (_range, query) => {
+				expect(query?.headers).toBeUndefined();
+				return state.headers as never;
+			});
+			await state.syncInbox('alice', 'account-alice', state.client);
+			const updated = snapshot('alice').messages.find((message) => message.uid === 7)!;
+			expect(updated.bimiLogo).toBe(logo);
+			expect(updated.read).toBe(true);
+			fetches.mockRestore();
+		} finally {
+			state.restore();
+		}
+	});
+
 	function bodyMocks(fetch: (...args: any[]) => Promise<any>) {
 		return import('imapflow').then(({ ImapFlow }) => {
 			const data = { ...snapshot('alice').accounts[0], imapHost: 'imap.mail.me.com' };

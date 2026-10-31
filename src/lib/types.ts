@@ -24,6 +24,7 @@ export interface Message {
 	path: string;
 	from: string;
 	fromAddress: string;
+	bimiLogo?: string | null;
 	to: string;
 	subject: string;
 	text: string;

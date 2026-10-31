@@ -48,6 +48,18 @@ Registration never creates a user — Apple signup must happen first
 
 Mailbox sync publishes metadata and queues body downloads separately — a message may initially omit `html` while content is pending, and a later revision supplies its body and attachments — `html: null` marks a loaded plain-text message
 
+Messages may include `bimiLogo`, a base64-encoded 192 × 192 PNG from trusted receiving-provider BIMI results — `null` means checked without usable artwork, and an absent field means not checked yet or an older server
+
+BIMI checks run during metadata sync, including a one-time header backfill for cached messages — the result belongs to the individual message and is never inherited from another message with the same sender
+
+The initial adapter recognizes exact authentication service IDs for Gmail (`mx.google.com`), iCloud (`bimi.icloud.com` and `dmarc.icloud.com`), and Fastmail (`messagingengine.com`), only through their matching IMAP hosts — acceptance requires unique provider results, `dmarc=pass` for the displayed From domain, `bimi=pass`, `policy.authority=pass`, an exact-domain BIMI assertion, and an embedded `BIMI-Indicator` matching `policy.indicator-hash`
+
+This uses the receiving provider's RFC 8601 trust boundary and relies on that provider removing forged results bearing its own authentication service ID — imported or client-appended messages are not independently authenticated by this implementation
+
+Providers and messages without that complete evidence fall back normally — URL-only logos, organizational-domain fallback, standalone certificate verification, and Apple's proprietary Branded Mail are outside this first version — no arbitrary logo URLs are fetched by the server
+
+The native client's avatar order is BIMI → Gravatar → business website icon → initials — Gravatar requests use the SHA-256 hash of the trimmed, lowercase sender address and `d=404`, so a missing Gravatar continues to the website fallback
+
 Body downloads use separate IMAP connections and a persistent queue — retries survive restarts, and completed downloads merge only content fields so newer flags and moves are preserved
 
 Account responses never include passwords — passwords can only be supplied through the connect and reconnect endpoints
