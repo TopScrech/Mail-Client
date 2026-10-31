@@ -170,7 +170,8 @@ export async function connectAccount(
 		smtpPort: Number(input.smtpPort),
 		lastSync: null,
 		error: null,
-		reconnectRequired: false
+		reconnectRequired: false,
+		color: existing ? (JSON.parse(existing.data).color ?? null) : null
 	};
 	assert(/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(data.email), 'Enter a valid email address');
 	assert([465, 587].includes(data.smtpPort), 'Use SMTP port 465 or 587');

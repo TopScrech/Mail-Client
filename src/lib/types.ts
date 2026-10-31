@@ -9,7 +9,23 @@ export interface MailAccount {
 	lastSync: string | null;
 	error: string | null;
 	reconnectRequired?: boolean;
+	color?: AccountColor | null;
 }
+export const accountColors = [
+	'red',
+	'orange',
+	'yellow',
+	'green',
+	'mint',
+	'teal',
+	'cyan',
+	'blue',
+	'indigo',
+	'purple',
+	'pink',
+	'brown'
+] as const;
+export type AccountColor = (typeof accountColors)[number];
 export interface Attachment {
 	index: number;
 	filename: string;

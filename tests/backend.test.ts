@@ -365,6 +365,29 @@ describe('Account labels', () => {
 		);
 		expect(snapshot('bob').accounts[0].name).toBe('bob');
 	});
+	test('sets and clears account colors without changing labels', async () => {
+		const name = snapshot('alice').accounts[0].name;
+		const set = await PATCH(event('accounts/account-alice', 'PATCH', { color: 'teal' }));
+		expect(set.status).toBe(200);
+		const after = await set.json();
+		expect(after.accounts[0].color).toBe('teal');
+		expect(after.accounts[0].name).toBe(name);
+		const both = await PATCH(
+			event('accounts/account-alice', 'PATCH', { name: 'Work', color: 'purple' })
+		);
+		expect((await both.json()).accounts[0]).toMatchObject({ name: 'Work', color: 'purple' });
+		const cleared = await PATCH(event('accounts/account-alice', 'PATCH', { color: null }));
+		expect((await cleared.json()).accounts[0].color).toBeNull();
+	});
+	test('rejects unsupported colors and empty updates', async () => {
+		for (const color of ['magenta', '#ff0000', 1, '']) {
+			expect((await PATCH(event('accounts/account-alice', 'PATCH', { color }))).status).toBe(400);
+		}
+		expect((await PATCH(event('accounts/account-alice', 'PATCH', {}))).status).toBe(400);
+		expect((await PATCH(event('accounts/account-bob', 'PATCH', { color: 'red' }))).status).toBe(
+			404
+		);
+	});
 });
 
 describe('Mailbox OAuth', () => {

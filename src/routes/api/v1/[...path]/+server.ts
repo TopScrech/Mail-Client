@@ -6,6 +6,7 @@ import {
 	mailOAuthCallback
 } from '$lib/server/mail-oauth';
 import { json, type RequestEvent } from '@sveltejs/kit';
+import { accountColors } from '$lib/types';
 import { ApiError, assert, origin, appleConfigured, allowedHosts } from '$lib/server/config';
 import { db, one, all, limit, cleanup, bump, snapshot, type User } from '$lib/server/db';
 import {
@@ -148,10 +149,16 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		);
 	}
 	if (path.startsWith('accounts/') && method === 'PATCH') {
-		const { name } = await body(event);
+		const { name, color } = await body(event);
+		assert(name !== undefined || color !== undefined, 'Nothing to update');
 		assert(
-			typeof name === 'string' && name.trim().length > 0 && name.trim().length <= 100,
+			name === undefined ||
+				(typeof name === 'string' && name.trim().length > 0 && name.trim().length <= 100),
 			'Account label must be between 1 and 100 characters'
+		);
+		assert(
+			color === undefined || color === null || accountColors.includes(color),
+			'Choose a supported account color'
 		);
 		return serialized(uid, async () => {
 			const id = path.slice(9);
@@ -163,7 +170,11 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 			assert(account, 'Account not found', 404);
 			db.transaction(() => {
 				db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
-					JSON.stringify({ ...JSON.parse(account.data), name: name.trim() }),
+					JSON.stringify({
+						...JSON.parse(account.data),
+						...(name === undefined ? {} : { name: name.trim() }),
+						...(color === undefined ? {} : { color })
+					}),
 					id,
 					uid
 				);
