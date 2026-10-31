@@ -3,7 +3,12 @@ import {
 	mailProvider,
 	oauthConfigured,
 	mailOAuthStart,
-	mailOAuthCallback
+	mailOAuthCallback,
+	mailOAuthNativeTicket,
+	redeemNativeTicket,
+	storeNativeResult,
+	redeemNativeResult,
+	nativeCallback
 } from '$lib/server/mail-oauth';
 import { json, type RequestEvent } from '@sveltejs/kit';
 import { accountColors } from '$lib/types';
@@ -38,6 +43,15 @@ async function body(event: RequestEvent) {
 		throw new ApiError(400, 'Invalid JSON request');
 	}
 }
+function oauthAccount(email: string, provider: 'google' | 'microsoft') {
+	return {
+		email,
+		name: email,
+		imapHost: provider === 'google' ? 'imap.gmail.com' : 'outlook.office365.com',
+		smtpHost: provider === 'google' ? 'smtp.gmail.com' : 'smtp.office365.com',
+		smtpPort: provider === 'google' ? 465 : 587
+	};
+}
 async function dispatch(event: RequestEvent): Promise<Response> {
 	const path = event.params.path || '';
 	const method = event.request.method;
@@ -68,6 +82,37 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return json(await passkeyOptions(event, false, (await body(event)).native === true));
 	if (path === 'auth/passkey/login/verify' && method === 'POST')
 		return json(await passkeyVerify(event, false, await body(event)));
+	if (path.startsWith('mail/oauth/') && method === 'GET') {
+		const [, , providerName, operation] = path.split('/');
+		const provider = mailProvider(providerName);
+		if (operation === 'start') {
+			const ticket = event.url.searchParams.get('ticket');
+			const nativeSession = ticket ? redeemNativeTicket(ticket, provider) : undefined;
+			if (!nativeSession) limit(`connect:${requireSession(event).user_id}`, 10, 3600_000);
+			return new Response(null, {
+				status: 302,
+				headers: { location: mailOAuthStart(event, provider, nativeSession) }
+			});
+		}
+		if (operation === 'callback') {
+			const { email, credentials, userId, sessionId, native } = await mailOAuthCallback(
+				event,
+				provider
+			);
+			if (native) {
+				event.cookies.delete('mail_oauth_native', { path: '/' });
+				const code = storeNativeResult(sessionId, email, credentials);
+				return new Response(null, {
+					status: 303,
+					headers: { location: `${nativeCallback}?code=${encodeURIComponent(code)}` }
+				});
+			}
+			await serialized(userId, async () => {
+				await connectAccount(userId, oauthAccount(email, provider), credentials);
+			});
+			return new Response(null, { status: 303, headers: { location: '/?mailConnected=1' } });
+		}
+	}
 	const auth = requireSession(event);
 	const uid = auth.user_id;
 	if (path === 'push/devices' && method === 'PUT') {
@@ -80,34 +125,6 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 	}
 	if (path === 'events' && method === 'GET') return eventStream(event, auth);
 	if (path === 'sync' && method === 'GET') void processPendingMoves(uid).catch(() => {});
-	if (path.startsWith('mail/oauth/') && method === 'GET') {
-		const [, , providerName, operation] = path.split('/');
-		const provider = mailProvider(providerName);
-		if (operation === 'start') {
-			limit(`connect:${uid}`, 10, 3600_000);
-			return new Response(null, {
-				status: 302,
-				headers: { location: mailOAuthStart(event, provider) }
-			});
-		}
-		if (operation === 'callback') {
-			const { email, credentials } = await mailOAuthCallback(event, provider);
-			await serialized(uid, async () => {
-				await connectAccount(
-					uid,
-					{
-						email,
-						name: email,
-						imapHost: provider === 'google' ? 'imap.gmail.com' : 'outlook.office365.com',
-						smtpHost: provider === 'google' ? 'smtp.gmail.com' : 'smtp.office365.com',
-						smtpPort: provider === 'google' ? 465 : 587
-					},
-					credentials
-				);
-			});
-			return new Response(null, { status: 303, headers: { location: '/?mailConnected=1' } });
-		}
-	}
 	if (path === 'me' && method === 'GET') return json(profile(event));
 	if (path === 'auth/passkey/register/options' && method === 'POST')
 		return json(await passkeyOptions(event, true, false));
@@ -135,6 +152,21 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		if (event.url.searchParams.get('since') === String(revision))
 			return new Response(null, { status: 204 });
 		return json(snapshot(uid));
+	}
+	if (path === 'mail/oauth/native/complete' && method === 'POST') {
+		limit(`connect:${uid}`, 10, 3600_000);
+		const { code } = await body(event);
+		assert(typeof code === 'string' && code.length > 0, 'Missing mail authorization code');
+		const { email, credentials } = redeemNativeResult(code, auth.id);
+		const provider = credentials.oauth!.provider;
+		return json(
+			await serialized(uid, () => connectAccount(uid, oauthAccount(email, provider), credentials)),
+			{ status: 201 }
+		);
+	}
+	if (/^mail\/oauth\/[^/]+\/native$/.test(path) && method === 'POST') {
+		limit(`connect:${uid}`, 10, 3600_000);
+		return json({ url: mailOAuthNativeTicket(auth.id, mailProvider(path.split('/')[2])) });
 	}
 	if (path === 'accounts' && method === 'POST') {
 		limit(`connect:${uid}`, 10, 3600_000);
@@ -388,14 +420,20 @@ async function handle(event: RequestEvent) {
 		const status = error instanceof ApiError ? error.status : 500;
 		const message =
 			error instanceof ApiError ? error.message : 'The request could not be completed';
-		if (event.params.path?.startsWith('mail/oauth/'))
+		if (event.request.method === 'GET' && event.params.path?.startsWith('mail/oauth/')) {
+			const native =
+				event.url.searchParams.has('ticket') || event.cookies.get('mail_oauth_native') === '1';
+			if (native) event.cookies.delete('mail_oauth_native', { path: '/' });
 			return new Response(null, {
 				status: 303,
 				headers: {
-					location: `/?mailError=${encodeURIComponent(message)}`,
+					location: native
+						? `${nativeCallback}?error=${encodeURIComponent(message)}`
+						: `/?mailError=${encodeURIComponent(message)}`,
 					'cache-control': 'no-store'
 				}
 			});
+		}
 		if (event.params.path === 'auth/apple/callback')
 			return new Response(null, {
 				status: 303,

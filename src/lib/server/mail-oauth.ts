@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { createRemoteJWKSet, decodeJwt, jwtVerify } from 'jose';
 import type { RequestEvent } from '@sveltejs/kit';
 import { assert, origin, secure, ApiError } from './config';
-import { opaque, hash } from './crypto';
-import { challenge, consume } from './db';
+import { opaque, hash, encrypt, decrypt } from './crypto';
+import { challenge, consume, one } from './db';
 import { requireSession } from './auth';
 import { MailAuthError } from './mail-errors';
 
@@ -58,13 +58,77 @@ function client(provider: MailProvider) {
 	};
 }
 const callback = (provider: MailProvider) => `${origin}/api/v1/mail/oauth/${provider}/callback`;
-export function mailOAuthStart(event: RequestEvent, provider: MailProvider) {
-	const session = requireSession(event);
+export const nativeCallback = 'mailotter://mail-oauth';
+function activeSession(id: string) {
+	const row = one<{ user_id: string }>(
+		'SELECT user_id FROM sessions WHERE id=? AND expires>?',
+		id,
+		Date.now()
+	);
+	assert(row, 'Sign in to continue', 401);
+	return row.user_id;
+}
+/** Issues a single-use link that lets a native app start mail OAuth in a browser session */
+export function mailOAuthNativeTicket(sessionId: string, provider: MailProvider) {
+	client(provider);
+	const ticket = opaque();
+	challenge(hash(ticket), 'mail-native-ticket', { sessionId, provider });
+	return `${origin}/api/v1/mail/oauth/${provider}/start?ticket=${ticket}`;
+}
+export function redeemNativeTicket(ticket: string, provider: MailProvider) {
+	const pending = consume<{ sessionId: string; provider: MailProvider }>(
+		hash(ticket),
+		'mail-native-ticket'
+	);
+	assert(pending.provider === provider, 'Mail authorization belongs to another provider', 403);
+	activeSession(pending.sessionId);
+	return pending.sessionId;
+}
+/** Holds native OAuth credentials until the signed-in app redeems them with its own session */
+export function storeNativeResult(sessionId: string, email: string, credentials: Credentials) {
+	const code = opaque();
+	challenge(hash(code), 'mail-native-result', {
+		sessionId,
+		email,
+		secret: encrypt(JSON.stringify(credentials), `mail-native:${sessionId}`)
+	});
+	return code;
+}
+export function redeemNativeResult(code: string, sessionId: string) {
+	const pending = consume<{ sessionId: string; email: string; secret: string }>(
+		hash(code),
+		'mail-native-result'
+	);
+	assert(pending.sessionId === sessionId, 'Mail authorization belongs to another session', 403);
+	return {
+		email: pending.email,
+		credentials: JSON.parse(decrypt(pending.secret, `mail-native:${sessionId}`)) as Credentials
+	};
+}
+export function mailOAuthStart(
+	event: RequestEvent,
+	provider: MailProvider,
+	nativeSession?: string
+) {
+	const sessionId = nativeSession ?? requireSession(event).id;
 	const { client_id } = client(provider);
 	const state = opaque(),
 		verifier = opaque(),
 		nonce = opaque();
-	challenge(hash(state), `mail-${provider}`, { sessionId: session.id, verifier, nonce });
+	challenge(hash(state), `mail-${provider}`, {
+		sessionId,
+		verifier,
+		nonce,
+		native: !!nativeSession
+	});
+	if (nativeSession)
+		event.cookies.set('mail_oauth_native', '1', {
+			path: '/',
+			httpOnly: true,
+			secure,
+			sameSite: 'lax',
+			maxAge: 300
+		});
 	event.cookies.set(`mail_oauth_${provider}`, state, {
 		path: '/',
 		httpOnly: true,
@@ -129,16 +193,23 @@ export async function refreshOAuth(tokens: OAuthTokens): Promise<OAuthTokens> {
 	};
 }
 export async function mailOAuthCallback(event: RequestEvent, provider: MailProvider) {
-	const session = requireSession(event);
 	const state = event.url.searchParams.get('state');
 	const cookie = event.cookies.get(`mail_oauth_${provider}`);
 	event.cookies.delete(`mail_oauth_${provider}`, { path: '/' });
 	assert(state && state === cookie, 'Mail authorization expired — try connecting again');
-	const pending = consume<{ sessionId: string; verifier: string; nonce: string }>(
-		hash(state),
-		`mail-${provider}`
-	);
-	assert(pending.sessionId === session.id, 'Mail authorization belongs to another session', 403);
+	const pending = consume<{
+		sessionId: string;
+		verifier: string;
+		nonce: string;
+		native?: boolean;
+	}>(hash(state), `mail-${provider}`);
+	const userId = pending.native ? activeSession(pending.sessionId) : requireSession(event).user_id;
+	if (!pending.native)
+		assert(
+			pending.sessionId === requireSession(event).id,
+			'Mail authorization belongs to another session',
+			403
+		);
 	assert(
 		!event.url.searchParams.has('error'),
 		'Mail connection was cancelled or permission was denied'
@@ -177,6 +248,9 @@ export async function mailOAuthCallback(event: RequestEvent, provider: MailProvi
 		assert(payload.email_verified === true, 'Google email is not verified');
 	return {
 		email,
+		userId,
+		sessionId: pending.sessionId,
+		native: !!pending.native,
 		credentials: {
 			username: email,
 			oauth: {

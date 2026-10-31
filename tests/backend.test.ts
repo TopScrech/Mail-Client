@@ -430,6 +430,64 @@ describe('Mailbox OAuth', () => {
 		expect(decodeURIComponent(rejected.headers.get('location')!)).toContain('another session');
 		expect(one('SELECT id FROM challenges')).toBeNull();
 	});
+	test('starts native mail OAuth from a single-use ticket', async () => {
+		process.env.GOOGLE_CLIENT_ID = 'test-google';
+		process.env.GOOGLE_CLIENT_SECRET = 'test-secret';
+		const issued = await POST(event('mail/oauth/google/native', 'POST', {}));
+		expect(issued.status).toBe(200);
+		const url = new URL((await issued.json()).url);
+		expect(url.pathname).toBe('/api/v1/mail/oauth/google/start');
+		const start = event(`mail/oauth/google/start${url.search}`, 'GET', undefined, null);
+		const response = await GET(start);
+		expect(new URL(response.headers.get('location')!).origin).toBe('https://accounts.google.com');
+		expect(start.cookies.get('mail_oauth_native')).toBe('1');
+		const reused = await GET(event(`mail/oauth/google/start${url.search}`, 'GET', undefined, null));
+		expect(reused.headers.get('location')).toStartWith('mailotter://mail-oauth?error=');
+	});
+	test('rejects native tickets for another provider', async () => {
+		process.env.GOOGLE_CLIENT_ID = 'test-google';
+		process.env.GOOGLE_CLIENT_SECRET = 'test-secret';
+		process.env.MICROSOFT_CLIENT_ID = 'test-microsoft';
+		process.env.MICROSOFT_CLIENT_SECRET = 'test-secret';
+		const issued = await POST(event('mail/oauth/google/native', 'POST', {}));
+		const url = new URL((await issued.json()).url);
+		const response = await GET(
+			event(`mail/oauth/microsoft/start${url.search}`, 'GET', undefined, null)
+		);
+		expect(decodeURIComponent(response.headers.get('location')!)).toContain('another provider');
+	});
+	test('returns native callback errors to the app', async () => {
+		process.env.GOOGLE_CLIENT_ID = 'test-google';
+		process.env.GOOGLE_CLIENT_SECRET = 'test-secret';
+		const issued = await POST(event('mail/oauth/google/native', 'POST', {}));
+		const url = new URL((await issued.json()).url);
+		const start = event(`mail/oauth/google/start${url.search}`, 'GET', undefined, null);
+		const location = new URL((await GET(start)).headers.get('location')!);
+		const callback = event(
+			`mail/oauth/google/callback?state=${location.searchParams.get('state')}&error=access_denied`,
+			'GET',
+			undefined,
+			null
+		);
+		callback.cookies = start.cookies;
+		const rejected = await GET(callback);
+		expect(rejected.headers.get('location')).toStartWith('mailotter://mail-oauth?error=');
+		expect(start.cookies.get('mail_oauth_native')).toBeUndefined();
+	});
+	test('only the starting session can redeem native mail credentials', async () => {
+		const { storeNativeResult } = await import('../src/lib/server/mail-oauth');
+		const aliceSession = one<{ id: string }>(
+			'SELECT id FROM sessions WHERE token_hash=?',
+			hash(tokens.alice)
+		)!.id;
+		const code = storeNativeResult(aliceSession, 'alice@gmail.com', {
+			username: 'alice@gmail.com',
+			oauth: { provider: 'google', accessToken: 'a', refreshToken: 'r', expiresAt: 0 }
+		});
+		const response = await POST(event('mail/oauth/native/complete', 'POST', { code }, 'bob'));
+		expect(response.status).toBe(403);
+		expect(one('SELECT id FROM challenges')).toBeNull();
+	});
 	test('keeps unexpired tokens without contacting provider', async () => {
 		const { refreshOAuth } = await import('../src/lib/server/mail-oauth');
 		const tokens = {
