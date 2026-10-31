@@ -120,3 +120,7 @@ Expired sessions cannot receive pushes
 Notifications contain sender, subject, and a `messageId` for navigation, without the message body
 The first inbox sync and UIDVALIDITY changes establish a baseline without sending historical alerts
 Subsequent new unread inbox messages are queued transactionally, with per-device deduplication, retries, and a one-hour expiry
+
+Messages include `websiteIconDomains` in priority order: the exact sender domain followed by its registrable domain when different — the Public Suffix List includes private suffixes, so fallbacks never cross into shared parents such as `co.uk` or `github.io` — personal mail providers and invalid or unrecognized domains return an empty list
+
+Native avatars try these website icons only after BIMI and Gravatar — website artwork remains decorative and does not establish sender authenticity — candidates are computed for existing messages in each snapshot without a database migration

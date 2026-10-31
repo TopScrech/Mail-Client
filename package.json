@@ -18,7 +18,8 @@
 		"imapflow": "^2.0.6",
 		"jose": "^6.2.12",
 		"mailparser": "^3.9.28",
-		"nodemailer": "^10.0.10"
+		"nodemailer": "^10.0.10",
+		"tldts": "^7.4.19"
 	},
 	"devDependencies": {
 		"@sveltejs/adapter-node": "^5.5.7",

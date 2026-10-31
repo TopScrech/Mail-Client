@@ -1,3 +1,4 @@
+import { websiteIconDomains } from './sender-icons';
 import { Database } from 'bun:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -54,7 +55,10 @@ export function snapshot(userId: string): Snapshot {
 			'SELECT data FROM messages WHERE user_id=? AND id NOT IN (SELECT message_id FROM pending_moves WHERE user_id=?)',
 			userId,
 			userId
-		).map((x) => JSON.parse(x.data)),
+		).map((x) => {
+			const message = JSON.parse(x.data);
+			return { ...message, websiteIconDomains: websiteIconDomains(message.fromAddress || '') };
+		}),
 		drafts: all<{ data: string }>('SELECT data FROM drafts WHERE user_id=?', userId).map((x) =>
 			JSON.parse(x.data)
 		)

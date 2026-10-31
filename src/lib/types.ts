@@ -25,6 +25,7 @@ export interface Message {
 	from: string;
 	fromAddress: string;
 	bimiLogo?: string | null;
+	websiteIconDomains?: string[];
 	to: string;
 	subject: string;
 	text: string;
