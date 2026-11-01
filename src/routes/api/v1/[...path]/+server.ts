@@ -23,7 +23,10 @@ import {
 	appleNativeOptions,
 	appleNativeVerify,
 	passkeyOptions,
-	passkeyVerify
+	passkeyVerify,
+	appleUnlinkOptions,
+	appleUnlinkVerify,
+	removePasskey
 } from '$lib/server/auth';
 import {
 	serialized,
@@ -131,6 +134,14 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 	if (path === 'events' && method === 'GET') return eventStream(event, auth);
 	if (path === 'sync' && method === 'GET') void processPendingMoves(uid).catch(() => {});
 	if (path === 'me' && method === 'GET') return json(profile(event));
+	if (path === 'auth/apple/unlink/options' && method === 'POST') {
+		limit(`apple-unlink:${auth.id}`, 10, 300_000);
+		return json(await appleUnlinkOptions(event));
+	}
+	if (path === 'auth/apple/unlink/verify' && method === 'POST') {
+		limit(`apple-unlink-verify:${auth.id}`, 10, 300_000);
+		return json(await appleUnlinkVerify(event, await body(event)));
+	}
 	if (path === 'auth/passkey/register/options' && method === 'POST')
 		return json(await passkeyOptions(event, true, false));
 	if (path === 'auth/passkey/register/verify' && method === 'POST')
@@ -149,7 +160,7 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return json({ ok: true });
 	}
 	if (path.startsWith('passkeys/') && method === 'DELETE') {
-		db.query('DELETE FROM passkeys WHERE id=? AND user_id=?').run(path.slice(9), uid);
+		removePasskey(event, path.slice(9));
 		return json({ ok: true });
 	}
 	if (path === 'sync' && method === 'GET') {

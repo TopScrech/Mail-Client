@@ -24,11 +24,25 @@ JSON errors use `{ "error": "Human-readable message" }` with an appropriate `4xx
 | GET    | `/me`                            | Profile, registered passkeys, and active sessions with a `current` flag                                                                           |
 | POST   | `/auth/logout`                   | Revokes the current session                                                                                                                       |
 | DELETE | `/sessions/:id`                  | Revokes an owned session                                                                                                                          |
-| DELETE | `/passkeys/:id`                  | Removes an owned passkey — Apple remains the primary account identity                                                                             |
+| DELETE | `/passkeys/:id`                  | Removes an owned passkey — the last passkey cannot be removed while Apple is unlinked                                                                             |
 
 Passkey option endpoints return `{ options, challengeId }` — pass `options` to WebAuthn, and return the credential as its JSON representation
 
 Registration never creates a user — Apple signup must happen first
+
+### Unlink Sign in with Apple
+
+Authenticated `POST /auth/apple/unlink/options` returns `{ options, challengeId }` for a fresh passkey assertion with required user verification and only the current user's registered passkeys
+Returns HTTP 409 if no passkey is registered or Apple is already unlinked
+
+Authenticated `POST /auth/apple/unlink/verify` accepts `{ challengeId, response }` and returns `{ ok: true }` after verifying the signature, origin, relying party, user verification, credential ownership, and original session
+The challenge expires after five minutes and is single-use and specific to unlinking — a login assertion cannot authorize unlinking
+
+`GET /me` includes `appleLinked` and a nullable `appleUserId`
+Unlinking removes only the Apple identity association — mail accounts, passkeys, and active sessions remain
+The existing account becomes passkey-only — signing in with the unlinked Apple identity subsequently creates a separate workspace
+The server refuses deletion of the last passkey on an unlinked account to preserve access
+An automatic transactional migration allows a null Apple identity and preserves existing user IDs and dependent records
 
 ## Mail and device state
 

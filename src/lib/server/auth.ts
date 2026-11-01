@@ -72,6 +72,7 @@ export function profile(event: RequestEvent) {
 		name: user.name,
 		email: user.email,
 		appleUserId: user.apple_sub,
+		appleLinked: user.apple_sub !== null,
 		passkeys: all<Passkey>('SELECT id,created_at FROM passkeys WHERE user_id=?', user.id).map(
 			(x) => ({ id: x.id, createdAt: x.created_at })
 		),
@@ -183,6 +184,96 @@ export async function passkeyVerify(
 	event.cookies.delete('webauthn', { path: '/' });
 	return newSession(event, key.user_id, pending.native);
 }
+export async function appleUnlinkOptions(event: RequestEvent) {
+	const current = requireSession(event);
+	const user = one<User>('SELECT * FROM users WHERE id=?', current.user_id)!;
+	assert(user.apple_sub, 'Sign in with Apple is already unlinked', 409);
+	const keys = all<Passkey>('SELECT * FROM passkeys WHERE user_id=?', current.user_id);
+	assert(keys.length, 'Add a passkey before unlinking Sign in with Apple', 409);
+	const options = await generateAuthenticationOptions({
+		rpID,
+		userVerification: 'required',
+		allowCredentials: keys.map((key) => ({ id: key.id, transports: JSON.parse(key.transports) }))
+	});
+	const challengeId = opaque();
+	challenge(challengeId, 'apple-unlink', {
+		challenge: options.challenge,
+		userId: current.user_id,
+		sessionId: current.id
+	});
+	return { options, challengeId };
+}
+
+export async function appleUnlinkVerify(
+	event: RequestEvent,
+	data: { challengeId: string; response: AuthenticationResponseJSON }
+) {
+	const current = requireSession(event);
+	assert(
+		typeof data.challengeId === 'string' && data.response && typeof data.response.id === 'string',
+		'Missing passkey verification'
+	);
+	const pending = consume<{ challenge: string; userId: string; sessionId: string }>(
+		data.challengeId,
+		'apple-unlink'
+	);
+	assert(
+		current.user_id === pending.userId && current.id === pending.sessionId,
+		'Sign-in session changed',
+		403
+	);
+	const key = one<Passkey>(
+		'SELECT * FROM passkeys WHERE id=? AND user_id=?',
+		data.response.id,
+		current.user_id
+	);
+	assert(key, 'Use a passkey registered to this account', 403);
+	const result = await verifyAuthenticationResponse({
+		response: data.response,
+		expectedChallenge: pending.challenge,
+		expectedOrigin: origin,
+		expectedRPID: rpID,
+		requireUserVerification: true,
+		credential: {
+			id: key.id,
+			publicKey: new Uint8Array(key.public_key),
+			counter: key.counter,
+			transports: JSON.parse(key.transports) as AuthenticatorTransport[]
+		}
+	});
+	assert(result.verified, 'Passkey could not be verified', 401);
+	db.transaction(() => {
+		const active = requireSession(event);
+		assert(active.id === current.id, 'Sign-in session changed', 403);
+		const saved = one<Passkey>(
+			'SELECT * FROM passkeys WHERE id=? AND user_id=?',
+			key.id,
+			current.user_id
+		);
+		assert(saved && saved.counter === key.counter, 'Passkey changed — please try again', 409);
+		db.query('UPDATE passkeys SET counter=? WHERE id=?').run(
+			result.authenticationInfo.newCounter,
+			key.id
+		);
+		db.query('UPDATE users SET apple_sub=NULL WHERE id=?').run(current.user_id);
+	})();
+	return { ok: true };
+}
+
+export function removePasskey(event: RequestEvent, id: string) {
+	const current = requireSession(event);
+	db.transaction(() => {
+		const user = one<User>('SELECT * FROM users WHERE id=?', current.user_id)!;
+		const keys = all<Passkey>('SELECT * FROM passkeys WHERE user_id=?', current.user_id);
+		assert(
+			user.apple_sub || keys.length > 1 || !keys.some((key) => key.id === id),
+			'Keep at least one passkey while Sign in with Apple is unlinked',
+			409
+		);
+		db.query('DELETE FROM passkeys WHERE id=? AND user_id=?').run(id, current.user_id);
+	})();
+}
+
 let appleKeys: JWTVerifyGetKey = createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
 /** Lets tests verify Apple identity tokens against local keys */
 export function useAppleKeys(keys: JWTVerifyGetKey) {

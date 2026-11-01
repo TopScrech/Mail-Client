@@ -1577,3 +1577,195 @@ describe('Push notifications', () => {
 		expect(one('SELECT id FROM push_jobs')).toBeNull();
 	});
 });
+
+describe('Unlinking Sign in with Apple', () => {
+	async function passkey(user: 'alice' | 'bob' = 'alice') {
+		const { generateKeyPairSync, createHash, sign } = await import('node:crypto');
+		const { publicKey: verifyingKey, privateKey: signingKey } = generateKeyPairSync('ec', {
+			namedCurve: 'prime256v1'
+		});
+		const jwk = verifyingKey.export({ format: 'jwk' });
+		const id = Buffer.from(`key-${user}`).toString('base64url');
+		const cose = Buffer.concat([
+			Buffer.from([0xa5, 1, 2, 3, 0x26, 0x20, 1, 0x21, 0x58, 0x20]),
+			Buffer.from(jwk.x!, 'base64url'),
+			Buffer.from([0x22, 0x58, 0x20]),
+			Buffer.from(jwk.y!, 'base64url')
+		]);
+		db.query('INSERT INTO passkeys VALUES (?,?,?,?,?,?)').run(
+			id,
+			user,
+			cose,
+			0,
+			'["internal"]',
+			new Date().toISOString()
+		);
+		return {
+			id,
+			proof(challenge: string, flags = 5, requestOrigin = origin, counterValue = 1) {
+				const clientData = Buffer.from(
+					JSON.stringify({ type: 'webauthn.get', challenge, origin: requestOrigin })
+				);
+				const counter = Buffer.alloc(4);
+				counter.writeUInt32BE(counterValue);
+				const authenticatorData = Buffer.concat([
+					createHash('sha256').update('localhost').digest(),
+					Buffer.from([flags]),
+					counter
+				]);
+				const signature = sign(
+					'sha256',
+					Buffer.concat([authenticatorData, createHash('sha256').update(clientData).digest()]),
+					signingKey
+				);
+				return {
+					id,
+					rawId: id,
+					type: 'public-key',
+					clientExtensionResults: {},
+					response: {
+						clientDataJSON: clientData.toString('base64url'),
+						authenticatorData: authenticatorData.toString('base64url'),
+						signature: signature.toString('base64url'),
+						userHandle: Buffer.from(user).toString('base64url')
+					}
+				};
+			}
+		};
+	}
+	async function options(user: 'alice' | 'bob' = 'alice') {
+		return (await POST(event('auth/apple/unlink/options', 'POST', {}, user))).json();
+	}
+	test('requires an authenticated account with a registered passkey', async () => {
+		expect((await POST(event('auth/apple/unlink/options', 'POST', {}, null))).status).toBe(401);
+		expect((await POST(event('auth/apple/unlink/options', 'POST', {}))).status).toBe(409);
+		expect(
+			one<{ apple_sub: string }>('SELECT apple_sub FROM users WHERE id=?', 'alice')?.apple_sub
+		).toBe('apple-alice');
+	});
+	test('verifies a fresh passkey, unlinks only Apple, and preserves mail and sessions', async () => {
+		const key = await passkey();
+		const challenge = await options();
+		expect(challenge.options.userVerification).toBe('required');
+		expect(challenge.options.allowCredentials.map((key: { id: string }) => key.id)).toEqual([
+			key.id
+		]);
+		const payload = {
+			challengeId: challenge.challengeId,
+			response: key.proof(challenge.options.challenge)
+		};
+		expect((await POST(event('auth/apple/unlink/verify', 'POST', payload))).status).toBe(200);
+		const me = await (await GET(event('me'))).json();
+		expect(me.appleUserId).toBeNull();
+		expect(me.appleLinked).toBe(false);
+		expect(me.passkeys).toHaveLength(1);
+		expect(snapshot('alice').accounts).toHaveLength(1);
+		expect(one('SELECT id FROM sessions WHERE id=?', 'session-alice')).not.toBeNull();
+		expect((await POST(event('auth/apple/unlink/verify', 'POST', payload))).status).not.toBe(200);
+		expect((await DELETE(event(`passkeys/${key.id}`, 'DELETE'))).status).toBe(409);
+		expect(one('SELECT id FROM passkeys WHERE id=?', key.id)).not.toBeNull();
+		const login = await (
+			await POST(event('auth/passkey/login/options', 'POST', { native: true }, null))
+		).json();
+		const signedIn = await POST(
+			event(
+				'auth/passkey/login/verify',
+				'POST',
+				{
+					challengeId: login.challengeId,
+					response: key.proof(login.options.challenge, 5, origin, 2)
+				},
+				null
+			)
+		);
+		expect(signedIn.status).toBe(200);
+		expect((await signedIn.json()).token).toBeString();
+	});
+	test('rejects another account’s passkey and challenges used by another session', async () => {
+		await passkey();
+		const other = await passkey('bob');
+		const challenge = await options();
+		expect(
+			(
+				await POST(
+					event('auth/apple/unlink/verify', 'POST', {
+						challengeId: challenge.challengeId,
+						response: other.proof(challenge.options.challenge)
+					})
+				)
+			).status
+		).toBe(403);
+		const sameAccount = await options();
+		db.query('INSERT INTO sessions VALUES (?,?,?,?,?,?)').run(
+			'session-alice-other',
+			'alice',
+			hash('another-token'),
+			'Other',
+			new Date().toISOString(),
+			Date.now() + 60_000
+		);
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/unlink/verify',
+						'POST',
+						{
+							challengeId: sameAccount.challengeId,
+							response: other.proof(sameAccount.options.challenge)
+						},
+						null,
+						{ authorization: 'Bearer another-token' }
+					)
+				)
+			).status
+		).toBe(403);
+		const second = await options();
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/unlink/verify',
+						'POST',
+						{ challengeId: second.challengeId, response: other.proof(second.options.challenge) },
+						'bob'
+					)
+				)
+			).status
+		).toBe(403);
+		expect((await GET(event('me'))).status).toBe(200);
+		expect(
+			one<{ apple_sub: string }>('SELECT apple_sub FROM users WHERE id=?', 'alice')?.apple_sub
+		).toBe('apple-alice');
+	});
+	test('rejects missing user verification, wrong origins, invalid signatures, and expired or login challenges', async () => {
+		const key = await passkey();
+		for (const kind of ['no-uv', 'origin', 'signature', 'expired', 'login']) {
+			const challenge = await options();
+			const response = key.proof(
+				challenge.options.challenge,
+				kind === 'no-uv' ? 1 : 5,
+				kind === 'origin' ? 'https://evil.example' : origin
+			);
+			if (kind === 'signature')
+				response.response.signature = Buffer.alloc(64).toString('base64url');
+			if (kind === 'expired')
+				db.query('UPDATE challenges SET expires=0 WHERE id=?').run(challenge.challengeId);
+			if (kind === 'login')
+				db.query("UPDATE challenges SET kind='login' WHERE id=?").run(challenge.challengeId);
+			expect(
+				(
+					await POST(
+						event('auth/apple/unlink/verify', 'POST', {
+							challengeId: challenge.challengeId,
+							response
+						})
+					)
+				).status
+			).not.toBe(200);
+			expect(
+				one<{ apple_sub: string }>('SELECT apple_sub FROM users WHERE id=?', 'alice')?.apple_sub
+			).toBe('apple-alice');
+		}
+	});
+});

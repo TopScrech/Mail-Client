@@ -5,12 +5,13 @@ import { dirname } from 'node:path';
 import { ApiError } from './config';
 import type { Snapshot } from '$lib/types';
 import { changed } from './events';
+import { allowUnlinkedAppleAccounts } from './migrations';
 const path = process.env.DATABASE_PATH || './data/mail-otter.sqlite';
 if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 export const db = new Database(path, { create: true });
 if (path !== ':memory:') chmodSync(path, 0o600);
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, apple_sub TEXT UNIQUE NOT NULL, name TEXT NOT NULL, email TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, apple_sub TEXT UNIQUE, name TEXT NOT NULL, email TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, token_hash TEXT UNIQUE NOT NULL, label TEXT NOT NULL, created_at TEXT NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS push_devices (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, token TEXT NOT NULL, environment TEXT NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(token,environment));
 CREATE TABLE IF NOT EXISTS push_checkpoints (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, validity TEXT NOT NULL, uid INTEGER NOT NULL);
@@ -28,9 +29,10 @@ CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL RE
 CREATE TABLE IF NOT EXISTS rate_limits (id TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS sends (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, state TEXT NOT NULL, expires INTEGER NOT NULL);
 `);
+allowUnlinkedAppleAccounts(db);
 export interface User {
 	id: string;
-	apple_sub: string;
+	apple_sub: string | null;
 	name: string;
 	email: string;
 	revision: number;
