@@ -840,6 +840,66 @@ export async function updateMessage(
 		await client.logout().catch(() => {});
 	}
 }
+export async function permanentlyDeleteMessage(userId: string, id: string) {
+	const mail = message(userId, id);
+	assert(mail.folder === 'trash', 'Only messages in Trash can be permanently deleted', 409);
+	assert(
+		!one('SELECT message_id FROM pending_moves WHERE message_id=? AND user_id=?', id, userId),
+		'This message has a pending move — refresh and try again',
+		409
+	);
+	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
+	const client = imap(data, credentials);
+	try {
+		await connectImap(client, userId, data.id);
+		const lock = await client.getMailboxLock(mail.path);
+		try {
+			assert(
+				client.mailbox && client.mailbox.uidValidity.toString() === mail.uidValidity,
+				'Mailbox changed — sync and try again',
+				409
+			);
+			const present = await client.fetchOne(mail.uid, { uid: true }, { uid: true });
+			if (present) {
+				// UID EXPUNGE targets only this message, preserving other messages marked Deleted
+				const uidExpunge =
+					client.capabilities.has('UIDPLUS') ||
+					client.enabled.has('IMAP4REV2') ||
+					(client.capabilities.has('IMAP4rev2') && !client.capabilities.has('IMAP4rev1'));
+				assert(
+					uidExpunge,
+					'Your mail server does not support safely deleting individual messages permanently',
+					422
+				);
+				assert(
+					await client.messageDelete(mail.uid, { uid: true }),
+					'The mail server could not permanently delete this message — try again',
+					502
+				);
+				assert(
+					!(await client.fetchOne(mail.uid, { uid: true }, { uid: true })),
+					'The message is still in Trash — permanent deletion could not be confirmed',
+					502
+				);
+			}
+		} finally {
+			lock.release();
+		}
+		db.transaction(() => {
+			db.query('DELETE FROM messages WHERE id=? AND user_id=?').run(id, userId);
+			bump(userId);
+		})();
+	} catch (error) {
+		if (error instanceof ApiError) throw error;
+		throw new ApiError(
+			502,
+			`Could not permanently delete this message — ${error instanceof Error ? error.message : 'try again'}`
+		);
+	} finally {
+		await client.logout().catch(() => {});
+	}
+}
+
 export async function attachment(userId: string, id: string, index: number) {
 	const mail = message(userId, id);
 	assert(

@@ -997,6 +997,224 @@ describe('Message move reconciliation', () => {
 	});
 });
 
+describe('Permanent deletion from Trash', () => {
+	async function fixture(
+		options: {
+			folder?: string;
+			uidValidity?: bigint;
+			unsupported?: boolean;
+			missing?: boolean;
+			failure?: boolean;
+			throws?: boolean;
+			rev2?: boolean;
+			remains?: boolean;
+		} = {}
+	) {
+		const { ImapFlow } = await import('imapflow');
+		const data = { ...snapshot('alice').accounts[0], imapHost: 'imap.mail.me.com' };
+		db.query('UPDATE accounts SET data=?,secret=? WHERE id=?').run(
+			JSON.stringify(data),
+			encrypt(JSON.stringify({ username: data.email, password: 'test' }), 'alice:account-alice'),
+			data.id
+		);
+		const mail = {
+			id: 'trashed',
+			accountId: data.id,
+			folder: options.folder || 'trash',
+			path: 'Trash',
+			uid: 7,
+			uidValidity: '1'
+		};
+		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
+			mail.id,
+			'alice',
+			data.id,
+			JSON.stringify(mail)
+		);
+		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
+			'other',
+			'alice',
+			data.id,
+			JSON.stringify({ ...mail, id: 'other', uid: 8 })
+		);
+		db.query('INSERT INTO body_jobs (message_id,user_id,account_id,size) VALUES (?,?,?,0)').run(
+			mail.id,
+			'alice',
+			data.id
+		);
+		let present = !options.missing;
+		const connect = spyOn(ImapFlow.prototype, 'connect').mockImplementation(async function (
+			this: InstanceType<typeof ImapFlow>
+		) {
+			if (options.rev2) this.enabled.add('IMAP4REV2');
+			else if (!options.unsupported) this.capabilities.set('UIDPLUS', true);
+		});
+		const fetch = spyOn(ImapFlow.prototype, 'fetchOne').mockImplementation(async () =>
+			present ? ({ uid: 7 } as never) : false
+		);
+		const remove = spyOn(ImapFlow.prototype, 'messageDelete').mockImplementation(async () => {
+			if (options.throws) throw new Error('Provider unavailable');
+			if (options.failure) return false;
+			if (!options.remains) present = false;
+			return true;
+		});
+		const mocks = [
+			spyOn(ImapFlow.prototype, 'fetchAll').mockImplementation(
+				async () =>
+					[
+						{ uid: 8, flags: new Set(), envelope: { subject: 'Other message' } },
+						...(present
+							? [{ uid: 7, flags: new Set(), envelope: { subject: 'Selected message' } }]
+							: [])
+					] as never
+			),
+			connect,
+			fetch,
+			remove,
+			spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'getMailboxLock').mockImplementation(async function (
+				this: InstanceType<typeof ImapFlow>
+			) {
+				this.mailbox = { uidValidity: options.uidValidity ?? 1n, exists: present ? 2 : 1 } as never;
+				return { release() {} } as never;
+			}),
+			spyOn(ImapFlow.prototype, 'list').mockResolvedValue([
+				{ path: 'Trash', specialUse: '\\Trash' }
+			] as never)
+		];
+		return { connect, fetch, remove, restore: () => mocks.forEach((mock) => mock.mockRestore()) };
+	}
+	const request = (input: Record<string, unknown> = {}, user: 'alice' | 'bob' = 'alice') =>
+		PATCH(event('messages', 'PATCH', { id: 'trashed', permanentlyDelete: true, ...input }, user));
+
+	test('confirmed deletion removes only the selected UID and cached body jobs, and refresh keeps it absent', async () => {
+		const state = await fixture();
+		try {
+			const response = await request();
+			expect(response.status).toBe(200);
+			expect(state.remove).toHaveBeenCalledWith(7, { uid: true });
+			expect(state.fetch).toHaveBeenCalledTimes(2);
+			expect((await response.json()).messages.map((m: { id: string }) => m.id)).toEqual(['other']);
+			expect(one('SELECT message_id FROM body_jobs WHERE message_id=?', 'trashed')).toBeNull();
+			expect(
+				(await (await GET(event('sync'))).json()).messages.map((m: { id: string }) => m.id)
+			).toEqual(['other']);
+			const reconciled = await POST(event('mail/sync', 'POST', {}));
+			expect(reconciled.status).toBe(200);
+			expect((await reconciled.json()).messages.map((m: { id: string }) => m.id)).toEqual([
+				'other'
+			]);
+			expect((await request()).status).toBe(404);
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('ordinary move-to-Trash requests never permanently delete messages already in Trash', async () => {
+		const state = await fixture();
+		const { processPendingMoves } = await import('../src/lib/server/mail');
+		try {
+			expect(
+				(await PATCH(event('messages', 'PATCH', { id: 'trashed', folder: 'trash' }))).status
+			).toBe(202);
+			await processPendingMoves('alice');
+			expect(state.remove).not.toHaveBeenCalled();
+			expect(one('SELECT id FROM messages WHERE id=?', 'trashed')).not.toBeNull();
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('ownership, Trash membership, explicit intent and conflicting changes are checked before connecting', async () => {
+		const state = await fixture({ folder: 'inbox' });
+		try {
+			expect((await request({}, 'bob')).status).toBe(404);
+			expect((await request()).status).toBe(409);
+			expect((await request({ folder: 'trash' })).status).toBe(400);
+			expect((await request({ read: true })).status).toBe(400);
+			expect((await request({ permanentlyDelete: false })).status).toBe(400);
+			expect(state.connect).not.toHaveBeenCalled();
+			expect(state.remove).not.toHaveBeenCalled();
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('mailbox identity changes never delete a recycled UID', async () => {
+		const state = await fixture({ uidValidity: 2n });
+		try {
+			expect((await request()).status).toBe(409);
+			expect(state.remove).not.toHaveBeenCalled();
+			expect(one('SELECT id FROM messages WHERE id=?', 'trashed')).not.toBeNull();
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('servers without targeted expunge support cannot expunge other deleted messages', async () => {
+		const state = await fixture({ unsupported: true });
+		try {
+			expect((await request()).status).toBe(422);
+			expect(state.remove).not.toHaveBeenCalled();
+			expect(snapshot('alice').messages).toHaveLength(2);
+		} finally {
+			state.restore();
+		}
+	});
+
+	for (const options of [{ failure: true }, { remains: true }, { throws: true }]) {
+		test(`provider deletion failure preserves the cached message: ${JSON.stringify(options)}`, async () => {
+			const state = await fixture(options);
+			try {
+				const response = await request();
+				expect(response.status).toBe(502);
+				if ('throws' in options)
+					expect((await response.json()).error).toContain('Provider unavailable');
+				expect(one('SELECT id FROM messages WHERE id=?', 'trashed')).not.toBeNull();
+				expect(
+					one('SELECT message_id FROM body_jobs WHERE message_id=?', 'trashed')
+				).not.toBeNull();
+			} finally {
+				state.restore();
+			}
+		});
+	}
+
+	test('IMAP4rev2 targeted expunge is accepted without a separate UIDPLUS advertisement', async () => {
+		const state = await fixture({ rev2: true });
+		try {
+			expect((await request()).status).toBe(200);
+			expect(state.remove).toHaveBeenCalledWith(7, { uid: true });
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('an already expunged UID removes the stale cache entry without attempting another deletion', async () => {
+		const state = await fixture({ missing: true, unsupported: true });
+		try {
+			expect((await request()).status).toBe(200);
+			expect(state.remove).not.toHaveBeenCalled();
+			expect(one('SELECT id FROM messages WHERE id=?', 'trashed')).toBeNull();
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('pending moves must finish before permanent deletion', async () => {
+		const state = await fixture();
+		const { queueMessageMove } = await import('../src/lib/server/mail');
+		try {
+			queueMessageMove('alice', 'trashed', { folder: 'inbox' });
+			expect((await request()).status).toBe(409);
+			expect(state.remove).not.toHaveBeenCalled();
+			expect(state.connect).not.toHaveBeenCalled();
+		} finally {
+			state.restore();
+		}
+	});
+});
+
 describe('Background sync error reporting', () => {
 	test('provider failures appear in snapshots with the original reason and account ownership', async () => {
 		const { recordSyncFailure } = await import('../src/lib/server/mail');

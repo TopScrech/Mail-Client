@@ -35,6 +35,7 @@ import {
 	connectAccount,
 	syncAccount,
 	updateMessage,
+	permanentlyDeleteMessage,
 	queueMessageMove,
 	processPendingMoves,
 	attachment,
@@ -277,6 +278,19 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		limit(`mail-action:${uid}`, 60);
 		const input = await body(event);
 		assert(typeof input.id === 'string', 'Missing message');
+		if (input.permanentlyDelete !== undefined) {
+			assert(
+				input.permanentlyDelete === true &&
+					input.folder === undefined &&
+					input.read === undefined &&
+					input.starred === undefined,
+				'Permanent deletion cannot be combined with other changes'
+			);
+			return serialized(uid, async () => {
+				await permanentlyDeleteMessage(uid, input.id);
+				return json({ ok: true, ...snapshot(uid) });
+			});
+		}
 		const change: { read?: boolean; starred?: boolean; folder?: Folder } = {};
 		if (typeof input.read === 'boolean') change.read = input.read;
 		if (typeof input.starred === 'boolean') change.starred = input.starred;
