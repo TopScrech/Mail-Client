@@ -100,8 +100,7 @@ The Sent, Archive, and Trash folders must advertise their IMAP special-use flags
 - IMAP connections retry with exponential backoff from 1 to 60 seconds — accounts requiring authentication reconnect stay paused until credentials are replaced
 - Browsers fetch the latest revision on SSE reconnect, focus, and every 10 minutes, with a 1-minute state polling fallback while the stream is disconnected
 - Mail accounts also refresh on sign-in and manual refresh — providers without IDLE use ImapFlow’s command fallback plus periodic reconciliation
-- Sync indexes every message in each supported folder per account, up to 10 accounts, with envelope requests batched in groups of 250
-- Message moves survive temporary provider failures and backend restarts, retry automatically with backoff, and remain hidden from their source mailbox while pending
+- Sync caches the newest 50 messages in each supported folder per account, up to 10 accounts
 - Search covers this cached window, not the provider’s full mailbox
 - Draft saves use optimistic concurrency based on the original `updatedAt` value — stale edits return `409` and remain open in the composer
 - Attachments are sent immediately or downloaded on demand — unsent attachments stay on the composing device and are not part of saved drafts

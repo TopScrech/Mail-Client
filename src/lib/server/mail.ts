@@ -301,9 +301,9 @@ async function syncFolder(
 				.filter((message) => message.path === path && message.uidValidity === uidValidity)
 				.map((message) => [message.uid, message])
 		);
-		// Reconcile every UID so older mail is retained and provider deletions are still removed
+		// UID membership detects deletions and keeps the 50-message window bounded on every server
 		const members = mailbox.exists
-			? await client.fetchAll('1:*', {
+			? await client.fetchAll(`${Math.max(1, mailbox.exists - 49)}:*`, {
 					uid: true,
 					...(!canDelta ? { flags: true } : {})
 				})
@@ -317,11 +317,9 @@ async function syncFolder(
 			userId
 		);
 		const imapHost = accountRow ? (JSON.parse(accountRow.data) as MailAccount).imapHost || '' : '';
-		const envelopes: FetchMessageObject[] = [];
-		for (let offset = 0; offset < missing.length; offset += 250) {
-			envelopes.push(
-				...(await client.fetchAll(
-					missing.slice(offset, offset + 250),
+		const envelopes = missing.length
+			? await client.fetchAll(
+					missing,
 					{
 						uid: true,
 						flags: true,
@@ -331,9 +329,8 @@ async function syncFolder(
 						size: true
 					},
 					{ uid: true }
-				))
-			);
-		}
+				)
+			: [];
 		const newHeaders = new Map(envelopes.map((header) => [header.uid, header]));
 		const known = members.filter((header) => cached.has(header.uid)).map((header) => header.uid);
 		const changed =
@@ -601,11 +598,7 @@ export async function syncAccount(userId: string, id: string) {
 			if (!latest) return;
 			const current: MailAccount = JSON.parse(latest.data);
 			current.lastSync = now();
-			if (
-				!current.reconnectRequired &&
-				!one('SELECT message_id FROM pending_moves WHERE account_id=? AND user_id=?', id, userId)
-			)
-				current.error = null;
+			if (!current.reconnectRequired) current.error = null;
 			const paths = new Set(folders.map((folder) => folder.path));
 			for (const row of all<{ id: string; data: string }>(
 				'SELECT id,data FROM messages WHERE account_id=? AND user_id=?',
@@ -662,8 +655,6 @@ interface PendingMove {
 	message: string;
 }
 const moveWorkers = new Map<string, Promise<void>>();
-const pendingMoveError =
-	'Message moves are waiting for your mail provider — they will retry automatically';
 export function queueMessageMove(
 	userId: string,
 	id: string,
@@ -688,16 +679,10 @@ export function processPendingMoves(userId: string): Promise<void> {
 		let move: PendingMove | null;
 		while (
 			(move = one<PendingMove>(
-				`SELECT p.* FROM pending_moves p JOIN accounts a ON a.id=p.account_id
-				LEFT JOIN pending_move_retries r ON r.message_id=p.message_id
-				WHERE p.user_id=? AND COALESCE(r.next_attempt,0)<=?
-				AND COALESCE(json_extract(a.data,'$.reconnectRequired'),0)=0
-				ORDER BY p.rowid LIMIT 1`,
-				userId,
-				Date.now()
+				'SELECT * FROM pending_moves WHERE user_id=? ORDER BY rowid LIMIT 1',
+				userId
 			))
 		) {
-			let retry = false;
 			let completed = false;
 			try {
 				await updateMessage(
@@ -708,10 +693,6 @@ export function processPendingMoves(userId: string): Promise<void> {
 				);
 				completed = true;
 			} catch (error) {
-				// Keep intent across outages and authentication renewal, including process restarts
-				retry =
-					!(error instanceof ApiError && error.status >= 400 && error.status < 500) ||
-					isMailAuthError(error);
 				const row = one<{ data: string }>(
 					'SELECT data FROM accounts WHERE id=? AND user_id=?',
 					move.account_id,
@@ -719,18 +700,15 @@ export function processPendingMoves(userId: string): Promise<void> {
 				);
 				if (row) {
 					const data: MailAccount = JSON.parse(row.data);
-					data.actionError = retry
-						? `${pendingMoveError}: ${error instanceof Error ? error.message : 'Unknown provider error'}`
-						: `A message could not be moved — ${error instanceof Error ? error.message : 'try again'}`;
+					data.actionError = `A message could not be moved — it was restored: ${error instanceof Error ? error.message : 'try again'}`;
 					if (!data.reconnectRequired) data.error = data.actionError;
 					db.transaction(() => {
-						if (!retry)
-							db.query('INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING').run(
-								move!.message_id,
-								userId,
-								move!.account_id,
-								move!.message
-							);
+						db.query('INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING').run(
+							move!.message_id,
+							userId,
+							move!.account_id,
+							move!.message
+						);
 						db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
 							JSON.stringify(data),
 							move!.account_id,
@@ -740,34 +718,27 @@ export function processPendingMoves(userId: string): Promise<void> {
 				}
 			} finally {
 				db.transaction(() => {
-					if (retry) {
-						db.query(
-							`INSERT INTO pending_move_retries (message_id,attempts,next_attempt) VALUES (?,1,?)
-							ON CONFLICT(message_id) DO UPDATE SET
-							next_attempt=? + MIN(60000, 1000 * (1 << MIN(attempts,6))), attempts=attempts+1`
-						).run(move!.message_id, Date.now() + 1000, Date.now());
-					} else {
-						db.query('DELETE FROM pending_moves WHERE message_id=? AND user_id=?').run(
-							move!.message_id,
+					db.query('DELETE FROM pending_moves WHERE message_id=? AND user_id=?').run(
+						move!.message_id,
+						userId
+					);
+					if (
+						completed &&
+						!one(
+							'SELECT message_id FROM pending_moves WHERE account_id=? AND user_id=?',
+							move!.account_id,
 							userId
-						);
+						)
+					) {
 						const owner = one<{ data: string }>(
 							'SELECT data FROM accounts WHERE id=? AND user_id=?',
 							move!.account_id,
 							userId
 						);
-						if (
-							owner &&
-							!one(
-								'SELECT message_id FROM pending_moves WHERE account_id=? AND user_id=?',
-								move!.account_id,
-								userId
-							)
-						) {
+						if (owner) {
 							const data: MailAccount = JSON.parse(owner.data);
-							if (completed && (data.actionError || data.error?.startsWith(pendingMoveError))) {
-								if (data.error === data.actionError || data.error?.startsWith(pendingMoveError))
-									data.error = null;
+							if (data.actionError) {
+								if (data.error === data.actionError) data.error = null;
 								data.actionError = null;
 								db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
 									JSON.stringify(data),
@@ -813,11 +784,7 @@ export async function updateMessage(
 			};
 			if (typeof change.read === 'boolean') await flags('\\Seen', change.read);
 			if (typeof change.starred === 'boolean') await flags('\\Flagged', change.starred);
-			if (
-				target &&
-				target !== mail.path &&
-				(await client.fetchOne(mail.uid, { uid: true }, { uid: true }))
-			) {
+			if (target && target !== mail.path) {
 				const result = await client.messageMove(mail.uid, target, { uid: true });
 				assert(result, 'Message could not be moved — sync and try again', 409);
 				const uid = result.uidMap?.get(mail.uid);

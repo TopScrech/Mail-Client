@@ -907,7 +907,6 @@ describe('Message move reconciliation', () => {
 				this.mailbox = { uidValidity: 1n } as never;
 				return { release() {} } as never;
 			}),
-			spyOn(ImapFlow.prototype, 'fetchOne').mockResolvedValue({ uid: 7 } as never),
 			spyOn(ImapFlow.prototype, 'messageMove').mockImplementation(async () => {
 				if (failure) throw new Error('Provider unavailable');
 				return { path: 'INBOX', destination: 'Trash', uidValidity: 2n, uidMap: new Map([[7, 42]]) };
@@ -950,7 +949,7 @@ describe('Message move reconciliation', () => {
 		expect(snapshot('alice').messages[0].id).toBe('account-alice:Trash:2:42');
 		expect(one('SELECT message_id FROM pending_moves')).toBeNull();
 	});
-	test('temporary move failure stays hidden across refresh and retries after an outage', async () => {
+	test('failed provider move keeps the cached message available for rollback', async () => {
 		const restore = await mockMove(true);
 		const revision = snapshot('alice').revision;
 		try {
@@ -959,95 +958,15 @@ describe('Message move reconciliation', () => {
 			const { processPendingMoves } = await import('../src/lib/server/mail');
 			await processPendingMoves('alice');
 			expect(snapshot('alice').revision).toBeGreaterThan(revision);
-			expect(snapshot('alice').accounts[0].error).toContain('retry automatically');
-			expect(snapshot('alice').accounts[0].error).toContain('Provider unavailable');
-			expect(one('SELECT message_id FROM pending_moves')).not.toBeNull();
-			expect(snapshot('alice').messages).toEqual([]);
-			expect((await (await GET(event('sync'))).json()).messages).toEqual([]);
-			const { ImapFlow } = await import('imapflow');
-			const move = spyOn(ImapFlow.prototype, 'messageMove').mockResolvedValue({
-				path: 'INBOX',
-				destination: 'Trash',
-				uidValidity: 2n,
-				uidMap: new Map([[7, 42]])
-			});
-			move.mockClear();
-			// Refreshes during backoff do not hammer the provider
-			await processPendingMoves('alice');
-			expect(move).not.toHaveBeenCalled();
-			db.query('UPDATE pending_move_retries SET next_attempt=0').run();
-			await processPendingMoves('alice');
-			expect(snapshot('alice').messages[0].folder).toBe('trash');
-			expect(snapshot('alice').accounts[0].error).toBeNull();
-			expect(snapshot('alice').accounts[0].actionError).toBeNull();
+			expect(snapshot('alice').accounts[0].error).toContain('restored');
+			expect(snapshot('alice').accounts[0].actionError).toContain('Provider unavailable');
 			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
-			expect(one('SELECT message_id FROM pending_move_retries')).toBeNull();
+			expect(snapshot('alice').messages[0].id).toBe('moving');
+			expect(snapshot('alice').messages[0].folder).toBe('inbox');
 		} finally {
 			restore();
 		}
 	});
-	test('a failed move does not block other queued messages', async () => {
-		const restore = await mockMove();
-		const { ImapFlow } = await import('imapflow');
-		const original = JSON.parse(
-			one<{ data: string }>('SELECT data FROM messages WHERE id=?', 'moving')!.data
-		);
-		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
-			'second',
-			'alice',
-			'account-alice',
-			JSON.stringify({ ...original, id: 'second', uid: 8 })
-		);
-		const move = spyOn(ImapFlow.prototype, 'messageMove').mockImplementation(async (uid) => {
-			if (uid === 7) throw new Error('Temporary provider failure');
-			return { path: 'INBOX', destination: 'Trash', uidValidity: 2n, uidMap: new Map([[8, 43]]) };
-		});
-		const { queueMessageMove, processPendingMoves } = await import('../src/lib/server/mail');
-		try {
-			queueMessageMove('alice', 'moving', { folder: 'trash' });
-			queueMessageMove('alice', 'second', { folder: 'trash' });
-			await processPendingMoves('alice');
-			expect(move).toHaveBeenCalledTimes(2);
-			expect(snapshot('alice').messages.map((message) => message.folder)).toEqual(['trash']);
-			expect(
-				one('SELECT message_id FROM pending_moves WHERE message_id=?', 'moving')
-			).not.toBeNull();
-			expect(one('SELECT message_id FROM pending_moves WHERE message_id=?', 'second')).toBeNull();
-		} finally {
-			restore();
-		}
-	});
-
-	test('authentication failures preserve deletion intent until the account reconnects', async () => {
-		const restore = await mockMove();
-		const { ImapFlow } = await import('imapflow');
-		const connect = spyOn(ImapFlow.prototype, 'connect').mockRejectedValue(
-			Object.assign(new Error('Authentication failed'), { authenticationFailed: true })
-		);
-		const { queueMessageMove, processPendingMoves } = await import('../src/lib/server/mail');
-		try {
-			queueMessageMove('alice', 'moving', { folder: 'trash' });
-			await processPendingMoves('alice');
-			expect(snapshot('alice').messages).toEqual([]);
-			expect(snapshot('alice').accounts[0].reconnectRequired).toBe(true);
-			expect(one('SELECT message_id FROM pending_moves')).not.toBeNull();
-			connect.mockClear();
-			db.query('UPDATE pending_move_retries SET next_attempt=0').run();
-			await processPendingMoves('alice');
-			expect(connect).not.toHaveBeenCalled();
-			// Reconnection resumes the persisted deletion rather than restoring the inbox message
-			db.query(
-				"UPDATE accounts SET data=json_set(data,'$.reconnectRequired',json('false'),'$.error',NULL) WHERE id=?"
-			).run('account-alice');
-			connect.mockResolvedValue(undefined);
-			await processPendingMoves('alice');
-			expect(snapshot('alice').messages[0].folder).toBe('trash');
-			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
-		} finally {
-			restore();
-		}
-	});
-
 	test('sync resumes a persisted move without relying on the original request', async () => {
 		const restore = await mockMove();
 		const { queueMessageMove, processPendingMoves } = await import('../src/lib/server/mail');
@@ -1063,42 +982,6 @@ describe('Message move reconciliation', () => {
 			restore();
 		}
 	});
-	test('a retry after an ambiguous successful move does not restore the missing source UID', async () => {
-		const restore = await mockMove();
-		const { ImapFlow } = await import('imapflow');
-		const source = spyOn(ImapFlow.prototype, 'fetchOne').mockResolvedValue(false);
-		const move = spyOn(ImapFlow.prototype, 'messageMove');
-		const { queueMessageMove, processPendingMoves } = await import('../src/lib/server/mail');
-		try {
-			queueMessageMove('alice', 'moving', { folder: 'trash' });
-			await processPendingMoves('alice');
-			expect(source).toHaveBeenCalledWith(7, { uid: true }, { uid: true });
-			expect(move).not.toHaveBeenCalled();
-			expect(snapshot('alice').messages).toEqual([]);
-			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
-			expect(one('SELECT id FROM messages WHERE id=?', 'moving')).toBeNull();
-		} finally {
-			restore();
-		}
-	});
-
-	test('permanent move errors restore the message with an actionable account error', async () => {
-		const restore = await mockMove();
-		const { ImapFlow } = await import('imapflow');
-		spyOn(ImapFlow.prototype, 'list').mockResolvedValue([]);
-		const { queueMessageMove, processPendingMoves } = await import('../src/lib/server/mail');
-		try {
-			queueMessageMove('alice', 'moving', { folder: 'trash' });
-			await processPendingMoves('alice');
-			expect(snapshot('alice').messages[0].id).toBe('moving');
-			expect(snapshot('alice').accounts[0].error).toContain('does not expose a trash folder');
-			expect(snapshot('alice').accounts[0].actionError).toContain('does not expose a trash folder');
-			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
-		} finally {
-			restore();
-		}
-	});
-
 	test('users cannot queue moves for another user’s messages', async () => {
 		const restore = await mockMove();
 		try {
@@ -1406,39 +1289,6 @@ describe('Inbox notification latency', () => {
 			expect(snapshot('alice').messages).toEqual([]);
 		} finally {
 			bodies.restore();
-			state.restore();
-		}
-	});
-
-	test('sync includes mail beyond the newest 50 and batches envelopes without pruning older messages', async () => {
-		const state = await fixture();
-		const headers = Array.from({ length: 501 }, (_, index) => ({
-			...state.headers[0],
-			uid: index + 1
-		}));
-		state.client.mailbox = { exists: headers.length, uidValidity: 1n } as never;
-		const fetches = spyOn(state.client, 'fetchAll').mockImplementation(async (range, query) => {
-			if (query.envelope) {
-				expect(Array.isArray(range)).toBe(true);
-				expect((range as number[]).length).toBeLessThanOrEqual(250);
-				return headers.filter((header) => (range as number[]).includes(header.uid)) as never;
-			}
-			expect(range).toBe('1:*');
-			return headers as never;
-		});
-		try {
-			await state.syncInbox('alice', 'account-alice', state.client);
-			expect(snapshot('alice').messages).toHaveLength(501);
-			expect(fetches.mock.calls.filter((call) => call[1].envelope)).toHaveLength(3);
-			// A subsequent reconciliation retains old mail, but removes a UID deleted at the provider
-			headers.splice(0, 1);
-			state.client.mailbox = { exists: headers.length, uidValidity: 1n } as never;
-			await state.syncInbox('alice', 'account-alice', state.client);
-			expect(snapshot('alice').messages).toHaveLength(500);
-			expect(snapshot('alice').messages.some((message) => message.uid === 1)).toBe(false);
-			expect(snapshot('alice').messages.some((message) => message.uid === 2)).toBe(true);
-			expect(fetches.mock.calls.filter((call) => call[1].envelope)).toHaveLength(3);
-		} finally {
 			state.restore();
 		}
 	});
