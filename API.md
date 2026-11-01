@@ -10,19 +10,21 @@ JSON errors use `{ "error": "Human-readable message" }` with an appropriate `4xx
 
 ## Authentication
 
-| Method | Path                             | Behavior                                                                                                                     |
-| ------ | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| GET    | `/config`                        | Reports Apple readiness and approved mail hosts                                                                              |
-| GET    | `/auth/apple/start`              | Redirects to Apple’s web authorization flow                                                                                  |
-| POST   | `/auth/apple/callback`           | Validates state, exchanges code, verifies identity token, creates or finds the Apple user, sets a cookie, and redirects home |
-| POST   | `/auth/passkey/register/options` | Requires a session — creates options for an additional passkey                                                               |
-| POST   | `/auth/passkey/register/verify`  | Requires the original session — verifies `{ challengeId, response }`                                                         |
-| POST   | `/auth/passkey/login/options`    | Creates discoverable credential options — accepts `{ native: true }` to request a bearer token on successful verification    |
-| POST   | `/auth/passkey/login/verify`     | Verifies `{ challengeId, response }` — a verified native flow returns `{ ok, token, expiresIn }`                             |
-| GET    | `/me`                            | Profile, registered passkeys, and active sessions with a `current` flag                                                      |
-| POST   | `/auth/logout`                   | Revokes the current session                                                                                                  |
-| DELETE | `/sessions/:id`                  | Revokes an owned session                                                                                                     |
-| DELETE | `/passkeys/:id`                  | Removes an owned passkey — Apple remains the primary account identity                                                        |
+| Method | Path                             | Behavior                                                                                                                                          |
+| ------ | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/config`                        | Reports Apple readiness and approved mail hosts                                                                                                   |
+| GET    | `/auth/apple/start`              | Redirects to Apple’s web authorization flow                                                                                                       |
+| POST   | `/auth/apple/callback`           | Validates state, exchanges code, verifies identity token, creates or finds the Apple user, sets a cookie, and redirects home                      |
+| POST   | `/auth/apple/native/options`     | Creates a single-use `{ challengeId, nonce }` for the app’s Sign in with Apple request                                                            |
+| POST   | `/auth/apple/native`             | Verifies `{ challengeId, identityToken, name? }` against `APPLE_APP_IDS`, finds or creates the Apple user, and returns `{ ok, token, expiresIn }` |
+| POST   | `/auth/passkey/register/options` | Requires a session — creates options for an additional passkey                                                                                    |
+| POST   | `/auth/passkey/register/verify`  | Requires the original session — verifies `{ challengeId, response }`                                                                              |
+| POST   | `/auth/passkey/login/options`    | Creates discoverable credential options — accepts `{ native: true }` to request a bearer token on successful verification                         |
+| POST   | `/auth/passkey/login/verify`     | Verifies `{ challengeId, response }` — a verified native flow returns `{ ok, token, expiresIn }`                                                  |
+| GET    | `/me`                            | Profile, registered passkeys, and active sessions with a `current` flag                                                                           |
+| POST   | `/auth/logout`                   | Revokes the current session                                                                                                                       |
+| DELETE | `/sessions/:id`                  | Revokes an owned session                                                                                                                          |
+| DELETE | `/passkeys/:id`                  | Removes an owned passkey — Apple remains the primary account identity                                                                             |
 
 Passkey option endpoints return `{ options, challengeId }` — pass `options` to WebAuthn, and return the credential as its JSON representation
 
@@ -30,19 +32,19 @@ Registration never creates a user — Apple signup must happen first
 
 ## Mail and device state
 
-| Method | Path                                   | Body or query                                                                                                             |
-| ------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| GET    | `/sync?since=<revision>`               | Returns `Snapshot`, or HTTP 204 when the revision matches                                                                 |
-| GET    | `/events`                             | Authenticated SSE stream — sends `event: revision` with the current revision as numeric `data` on connect and after committed changes |
-| POST   | `/accounts`                            | `{ name, email, username?, password, imapHost, smtpHost, smtpPort }` — validates IMAP and SMTP before storing credentials |
-| POST   | `/accounts/:id/reconnect` | Same body as `/accounts` with the existing email — verifies credentials and keeps the account ID, cached messages, and drafts |
-| DELETE | `/accounts/:id`                        | Disconnects from all devices and removes cached mail and associated drafts — provider mail is untouched                   |
-| POST   | `/mail/sync`                           | `{ accountId? }` — synchronizes one or all owned accounts and returns the snapshot plus an `errors` array                 |
-| PATCH  | `/messages`                            | `{ id, read?, starred?, folder? }` — destination folder is `inbox`, `archive`, or `trash`                                 |
-| GET    | `/attachment?id=<messageId>&index=<n>` | Downloads one attachment as an opaque file                                                                                |
-| PUT    | `/drafts`                              | `{ draft }` — `updatedAt` is empty for a new draft, or the timestamp from the last fetched version                        |
-| DELETE | `/drafts/:id`                          | Removes an owned draft                                                                                                    |
-| POST   | `/send`                                | Multipart: `draft` as JSON, `requestId` as a UUID, and optional repeated `files` fields                                   |
+| Method | Path                                   | Body or query                                                                                                                         |
+| ------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/sync?since=<revision>`               | Returns `Snapshot`, or HTTP 204 when the revision matches                                                                             |
+| GET    | `/events`                              | Authenticated SSE stream — sends `event: revision` with the current revision as numeric `data` on connect and after committed changes |
+| POST   | `/accounts`                            | `{ name, email, username?, password, imapHost, smtpHost, smtpPort }` — validates IMAP and SMTP before storing credentials             |
+| POST   | `/accounts/:id/reconnect`              | Same body as `/accounts` with the existing email — verifies credentials and keeps the account ID, cached messages, and drafts         |
+| DELETE | `/accounts/:id`                        | Disconnects from all devices and removes cached mail and associated drafts — provider mail is untouched                               |
+| POST   | `/mail/sync`                           | `{ accountId? }` — synchronizes one or all owned accounts and returns the snapshot plus an `errors` array                             |
+| PATCH  | `/messages`                            | `{ id, read?, starred?, folder? }` — destination folder is `inbox`, `archive`, or `trash`                                             |
+| GET    | `/attachment?id=<messageId>&index=<n>` | Downloads one attachment as an opaque file                                                                                            |
+| PUT    | `/drafts`                              | `{ draft }` — `updatedAt` is empty for a new draft, or the timestamp from the last fetched version                                    |
+| DELETE | `/drafts/:id`                          | Removes an owned draft                                                                                                                |
+| POST   | `/send`                                | Multipart: `draft` as JSON, `requestId` as a UUID, and optional repeated `files` fields                                               |
 
 `Snapshot` contains `revision`, `accounts`, `messages`, and `drafts` — the canonical TypeScript wire shapes are in `src/lib/types.ts`
 
@@ -112,7 +114,7 @@ The native app registers a destructive Delete action for that category and sends
 Authenticated `PUT /api/v1/push/devices` registers or refreshes an APNs installation
 
 ```json
-{"token":"hex-encoded APNs device token","environment":"development"}
+{ "token": "hex-encoded APNs device token", "environment": "development" }
 ```
 
 `environment` accepts `development` or `production` and must match the signed app's APNs entitlement

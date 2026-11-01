@@ -51,15 +51,16 @@ Apple web sign-in requires an Apple Developer configuration and an HTTPS domain,
 4. Create a Sign in with Apple key and download its `.p8` file
 5. Set these environment values:
 
-| Variable            | Value                                                                   |
-| ------------------- | ----------------------------------------------------------------------- |
-| `ORIGIN`            | `https://your-domain` without a trailing slash                          |
-| `RP_ID`             | `your-domain` without a scheme or port                                  |
-| `APPLE_CLIENT_ID`   | Web Services ID                                                         |
-| `APPLE_TEAM_ID`     | Apple Developer Team ID                                                 |
-| `APPLE_KEY_ID`      | Signing key identifier                                                  |
-| `APPLE_PRIVATE_KEY` | Full `.p8` content, using literal `\n` separators if stored on one line |
-| `ENCRYPTION_KEY`    | A stable, base64-encoded random 32-byte key                             |
+| Variable            | Value                                                                                                                  |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `ORIGIN`            | `https://your-domain` without a trailing slash                                                                         |
+| `RP_ID`             | `your-domain` without a scheme or port                                                                                 |
+| `APPLE_CLIENT_ID`   | Web Services ID                                                                                                        |
+| `APPLE_TEAM_ID`     | Apple Developer Team ID                                                                                                |
+| `APPLE_KEY_ID`      | Signing key identifier                                                                                                 |
+| `APPLE_PRIVATE_KEY` | Full `.p8` content, using literal `\n` separators if stored on one line                                                |
+| `APPLE_APP_IDS`     | Optional comma-separated app bundle IDs accepted for native Sign in with Apple, defaults to `dev.topscrech.Mail-Otter` |
+| `ENCRYPTION_KEY`    | A stable, base64-encoded random 32-byte key                                                                            |
 
 Use a deployed HTTPS host or an HTTPS development tunnel registered with Apple, with `ORIGIN` and `RP_ID` set to that domain
 

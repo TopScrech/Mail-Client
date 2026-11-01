@@ -316,6 +316,97 @@ describe('Credential storage and input limits', () => {
 	});
 });
 
+const { generateKeyPair, exportJWK, SignJWT, createLocalJWKSet } = await import('jose');
+const { useAppleKeys } = await import('../src/lib/server/auth');
+const { publicKey, privateKey } = await generateKeyPair('RS256');
+useAppleKeys(createLocalJWKSet({ keys: [{ ...(await exportJWK(publicKey)), alg: 'RS256' }] }));
+describe('Native Sign in with Apple', () => {
+	const identity = (claims: Record<string, unknown>, audience = 'dev.topscrech.Mail-Otter') =>
+		new SignJWT(claims)
+			.setProtectedHeader({ alg: 'RS256' })
+			.setIssuer('https://appleid.apple.com')
+			.setAudience(audience)
+			.setIssuedAt()
+			.setExpirationTime('5m')
+			.sign(privateKey);
+	const options = async () =>
+		(await (await POST(event('auth/apple/native/options', 'POST', {}, null))).json()) as {
+			challengeId: string;
+			nonce: string;
+		};
+	test('signs in the existing user linked to the Apple identity', async () => {
+		const { challengeId, nonce } = await options();
+		const identityToken = await identity({ sub: 'apple-alice', nonce });
+		const response = await POST(
+			event('auth/apple/native', 'POST', { challengeId, identityToken }, null)
+		);
+		expect(response.status).toBe(200);
+		const session = await response.json();
+		expect(session.token).toBeString();
+		const me = await (
+			await GET(event('me', 'GET', undefined, null, { authorization: `Bearer ${session.token}` }))
+		).json();
+		expect(me.id).toBe('alice');
+		expect(me.appleUserId).toBe('apple-alice');
+	});
+	test('creates a user for a new Apple identity', async () => {
+		const { challengeId, nonce } = await options();
+		const identityToken = await identity({ sub: 'apple-carol', nonce, email: 'c@example.com' });
+		const response = await POST(
+			event('auth/apple/native', 'POST', { challengeId, identityToken, name: 'Carol' }, null)
+		);
+		expect(response.status).toBe(200);
+		expect(
+			one<{ name: string }>("SELECT name FROM users WHERE apple_sub='apple-carol'")?.name
+		).toBe('Carol');
+	});
+	test('rejects mismatched nonces, other audiences, and replayed challenges', async () => {
+		const first = await options();
+		const wrongNonce = await identity({ sub: 'apple-alice', nonce: 'other' });
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/native',
+						'POST',
+						{ challengeId: first.challengeId, identityToken: wrongNonce },
+						null
+					)
+				)
+			).status
+		).toBe(401);
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/native',
+						'POST',
+						{
+							challengeId: first.challengeId,
+							identityToken: await identity({ sub: 'apple-alice', nonce: first.nonce })
+						},
+						null
+					)
+				)
+			).status
+		).toBe(400);
+		const second = await options();
+		const otherApp = await identity({ sub: 'apple-alice', nonce: second.nonce }, 'com.example');
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/native',
+						'POST',
+						{ challengeId: second.challengeId, identityToken: otherApp },
+						null
+					)
+				)
+			).status
+		).toBe(401);
+	});
+});
+
 describe('Delivery idempotency', () => {
 	test('a confirmed retry returns success without reconnecting to SMTP', async () => {
 		const { send } = await import('../src/lib/server/mail');

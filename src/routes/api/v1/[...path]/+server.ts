@@ -20,6 +20,8 @@ import {
 	profile,
 	appleStart,
 	appleCallback,
+	appleNativeOptions,
+	appleNativeVerify,
 	passkeyOptions,
 	passkeyVerify
 } from '$lib/server/auth';
@@ -78,6 +80,9 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return new Response(null, { status: 302, headers: { location: appleStart(event) } });
 	if (path === 'auth/apple/callback' && method === 'POST')
 		return new Response(null, { status: 303, headers: { location: await appleCallback(event) } });
+	if (path === 'auth/apple/native/options' && method === 'POST') return json(appleNativeOptions());
+	if (path === 'auth/apple/native' && method === 'POST')
+		return json(await appleNativeVerify(event, await body(event)));
 	if (path === 'auth/passkey/login/options' && method === 'POST')
 		return json(await passkeyOptions(event, false, (await body(event)).native === true));
 	if (path === 'auth/passkey/login/verify' && method === 'POST')

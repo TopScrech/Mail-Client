@@ -8,9 +8,9 @@ import {
 	type AuthenticationResponseJSON,
 	type AuthenticatorTransport
 } from '@simplewebauthn/server';
-import { createRemoteJWKSet, importPKCS8, SignJWT, jwtVerify } from 'jose';
+import { createRemoteJWKSet, importPKCS8, SignJWT, jwtVerify, type JWTVerifyGetKey } from 'jose';
 import { db, one, all, challenge, consume, type User } from './db';
-import { origin, rpID, secure, assert, appleConfigured } from './config';
+import { origin, rpID, secure, assert, appleConfigured, ApiError } from './config';
 import { opaque, hash } from './crypto';
 const duration = 30 * 86400;
 export interface Session {
@@ -71,6 +71,7 @@ export function profile(event: RequestEvent) {
 		id: user.id,
 		name: user.name,
 		email: user.email,
+		appleUserId: user.apple_sub,
 		passkeys: all<Passkey>('SELECT id,created_at FROM passkeys WHERE user_id=?', user.id).map(
 			(x) => ({ id: x.id, createdAt: x.created_at })
 		),
@@ -182,7 +183,65 @@ export async function passkeyVerify(
 	event.cookies.delete('webauthn', { path: '/' });
 	return newSession(event, key.user_id, pending.native);
 }
-const appleKeys = createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
+let appleKeys: JWTVerifyGetKey = createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
+/** Lets tests verify Apple identity tokens against local keys */
+export function useAppleKeys(keys: JWTVerifyGetKey) {
+	appleKeys = keys;
+}
+/** Bundle identifiers whose native Sign in with Apple tokens are accepted */
+export const appleAppIds = () =>
+	(process.env.APPLE_APP_IDS || 'dev.topscrech.Mail-Otter')
+		.split(',')
+		.map((x) => x.trim())
+		.filter(Boolean);
+function appleUser(sub: string, name: string, email: unknown) {
+	let user = one<User>('SELECT * FROM users WHERE apple_sub=?', sub);
+	if (!user) {
+		db.query(
+			'INSERT INTO users (id,apple_sub,name,email) VALUES (?,?,?,?) ON CONFLICT(apple_sub) DO NOTHING'
+		).run(
+			crypto.randomUUID(),
+			sub,
+			name.slice(0, 120) || 'Your workspace',
+			typeof email === 'string' ? email : ''
+		);
+		user = one<User>('SELECT * FROM users WHERE apple_sub=?', sub)!;
+	}
+	return user;
+}
+export function appleNativeOptions() {
+	const challengeId = opaque();
+	const nonce = opaque();
+	challenge(challengeId, 'apple-native', { nonce });
+	return { challengeId, nonce };
+}
+export async function appleNativeVerify(
+	event: RequestEvent,
+	data: { challengeId?: unknown; identityToken?: unknown; name?: unknown }
+) {
+	assert(
+		typeof data.challengeId === 'string' && typeof data.identityToken === 'string',
+		'Missing Apple sign-in details'
+	);
+	const pending = consume<{ nonce: string }>(data.challengeId, 'apple-native');
+	let payload;
+	try {
+		({ payload } = await jwtVerify(data.identityToken, appleKeys, {
+			issuer: 'https://appleid.apple.com',
+			audience: appleAppIds(),
+			algorithms: ['RS256']
+		}));
+	} catch {
+		throw new ApiError(401, 'Apple identity could not be verified');
+	}
+	assert(
+		payload.sub && payload.nonce === pending.nonce,
+		'Apple identity could not be verified',
+		401
+	);
+	const name = typeof data.name === 'string' ? data.name.trim() : '';
+	return newSession(event, appleUser(payload.sub, name, payload.email).id, true);
+}
 export function appleStart(event: RequestEvent) {
 	assert(appleConfigured(), 'Sign in with Apple needs to be configured on this server', 503);
 	const state = opaque();
@@ -246,26 +305,14 @@ export async function appleCallback(event: RequestEvent) {
 		'Apple identity could not be verified',
 		401
 	);
-	let user = one<User>('SELECT * FROM users WHERE apple_sub=?', payload.sub);
-	if (!user) {
-		const id = crypto.randomUUID();
-		let name = 'Your workspace';
-		try {
-			const supplied = JSON.parse(String(form.get('user') || '{}'));
-			name =
-				[supplied.name?.firstName, supplied.name?.lastName]
-					.filter(Boolean)
-					.join(' ')
-					.slice(0, 120) || name;
-		} catch {
-			/* Apple sends the name only on the first authorization */
-		}
-		const email = typeof payload.email === 'string' ? payload.email : '';
-		db.query(
-			'INSERT INTO users (id,apple_sub,name,email) VALUES (?,?,?,?) ON CONFLICT(apple_sub) DO NOTHING'
-		).run(id, payload.sub, name, email);
-		user = one<User>('SELECT * FROM users WHERE apple_sub=?', payload.sub)!;
+	let name = '';
+	try {
+		const supplied = JSON.parse(String(form.get('user') || '{}'));
+		name = [supplied.name?.firstName, supplied.name?.lastName].filter(Boolean).join(' ');
+	} catch {
+		/* Apple sends the name only on the first authorization */
 	}
+	const user = appleUser(payload.sub, name, payload.email);
 	newSession(event, user.id);
 	return '/';
 }
