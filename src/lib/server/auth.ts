@@ -315,9 +315,14 @@ export async function appleNativeVerify(
 		'Missing Apple sign-in details'
 	);
 	const pending = consume<{ nonce: string }>(data.challengeId, 'apple-native');
+	const payload = await verifyAppleIdentity(data.identityToken, pending.nonce);
+	const name = typeof data.name === 'string' ? data.name.trim() : '';
+	return newSession(event, appleUser(payload.sub, name, payload.email).id, true);
+}
+async function verifyAppleIdentity(identityToken: string, nonce: string) {
 	let payload;
 	try {
-		({ payload } = await jwtVerify(data.identityToken, appleKeys, {
+		({ payload } = await jwtVerify(identityToken, appleKeys, {
 			issuer: 'https://appleid.apple.com',
 			audience: appleAppIds(),
 			algorithms: ['RS256']
@@ -325,14 +330,54 @@ export async function appleNativeVerify(
 	} catch {
 		throw new ApiError(401, 'Apple identity could not be verified');
 	}
-	assert(
-		payload.sub && payload.nonce === pending.nonce,
-		'Apple identity could not be verified',
-		401
-	);
-	const name = typeof data.name === 'string' ? data.name.trim() : '';
-	return newSession(event, appleUser(payload.sub, name, payload.email).id, true);
+	assert(payload.sub && payload.nonce === nonce, 'Apple identity could not be verified', 401);
+	return payload;
 }
+
+export function appleLinkOptions(event: RequestEvent) {
+	const current = requireSession(event);
+	const user = one<User>('SELECT * FROM users WHERE id=?', current.user_id)!;
+	assert(!user.apple_sub, 'Sign in with Apple is already linked', 409);
+	const challengeId = opaque();
+	const nonce = opaque();
+	challenge(challengeId, 'apple-link', { nonce, userId: current.user_id, sessionId: current.id });
+	return { challengeId, nonce };
+}
+
+export async function appleLinkVerify(
+	event: RequestEvent,
+	data: { challengeId?: unknown; identityToken?: unknown }
+) {
+	const current = requireSession(event);
+	assert(
+		typeof data.challengeId === 'string' && typeof data.identityToken === 'string',
+		'Missing Apple linking details'
+	);
+	const pending = consume<{ nonce: string; userId: string; sessionId: string }>(
+		data.challengeId,
+		'apple-link'
+	);
+	assert(
+		current.user_id === pending.userId && current.id === pending.sessionId,
+		'Sign-in session changed',
+		403
+	);
+	const payload = await verifyAppleIdentity(data.identityToken, pending.nonce);
+	db.transaction(() => {
+		const active = requireSession(event);
+		assert(active.id === current.id, 'Sign-in session changed', 403);
+		const user = one<User>('SELECT * FROM users WHERE id=?', current.user_id)!;
+		assert(!user.apple_sub, 'Sign in with Apple is already linked', 409);
+		assert(
+			!one<User>('SELECT * FROM users WHERE apple_sub=?', payload.sub!),
+			'This Apple Account is already linked to another Mail Otter account',
+			409
+		);
+		db.query('UPDATE users SET apple_sub=? WHERE id=?').run(payload.sub!, current.user_id);
+	})();
+	return { ok: true };
+}
+
 export function appleStart(event: RequestEvent) {
 	assert(appleConfigured(), 'Sign in with Apple needs to be configured on this server', 503);
 	const state = opaque();

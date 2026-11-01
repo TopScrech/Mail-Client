@@ -44,6 +44,14 @@ The existing account becomes passkey-only — signing in with the unlinked Apple
 The server refuses deletion of the last passkey on an unlinked account to preserve access
 An automatic transactional migration allows a null Apple identity and preserves existing user IDs and dependent records
 
+### Link Sign in with Apple
+
+Authenticated `POST /auth/apple/link/options` returns a single-use `{ challengeId, nonce }` bound to the current user and session — the account must be unlinked
+Use that nonce in a native Apple authorization request, then send `{ challengeId, identityToken }` to authenticated `POST /auth/apple/link/verify`
+The server verifies Apple's signature, issuer, native audience, expiry, and nonce before adding the Apple identity to the current account
+Both endpoints return HTTP 409 if Apple is already linked — verification also returns HTTP 409 if the identity belongs to another Mail Otter account
+Linking never merges accounts, creates a workspace, changes mail data, or replaces the current session
+
 ## Mail and device state
 
 | Method | Path                                   | Body or query                                                                                                                         |

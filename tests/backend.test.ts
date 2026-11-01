@@ -1769,3 +1769,137 @@ describe('Unlinking Sign in with Apple', () => {
 		}
 	});
 });
+
+describe('Linking Sign in with Apple', () => {
+	beforeEach(() => {
+		db.query('UPDATE users SET apple_sub=NULL WHERE id=?').run('alice');
+	});
+	const identity = (nonce: string, sub = 'apple-relinked', audience = 'dev.topscrech.Mail-Otter') =>
+		new SignJWT({ sub, nonce })
+			.setProtectedHeader({ alg: 'RS256' })
+			.setIssuer('https://appleid.apple.com')
+			.setAudience(audience)
+			.setIssuedAt()
+			.setExpirationTime('5m')
+			.sign(privateKey);
+	const options = async () => (await POST(event('auth/apple/link/options', 'POST', {}))).json();
+	const verify = async (challengeId: string, identityToken: string) =>
+		POST(event('auth/apple/link/verify', 'POST', { challengeId, identityToken }));
+
+	test('requires authentication and an unlinked account', async () => {
+		expect((await POST(event('auth/apple/link/options', 'POST', {}, null))).status).toBe(401);
+		expect((await POST(event('auth/apple/link/verify', 'POST', {}, null))).status).toBe(401);
+		expect((await POST(event('auth/apple/link/options', 'POST', {}, 'bob'))).status).toBe(409);
+	});
+	test('links to the current account and subsequent Apple sign-in opens the same workspace', async () => {
+		const challenge = await options();
+		expect((await verify(challenge.challengeId, await identity(challenge.nonce))).status).toBe(200);
+		const me = await (await GET(event('me'))).json();
+		expect(me.id).toBe('alice');
+		expect(me.appleUserId).toBe('apple-relinked');
+		expect(me.appleLinked).toBe(true);
+		expect(snapshot('alice').accounts[0].id).toBe('account-alice');
+		expect(one<{ n: number }>('SELECT count(*) n FROM users')?.n).toBe(2);
+		expect(one<{ n: number }>('SELECT count(*) n FROM sessions')?.n).toBe(2);
+		const login = await (await POST(event('auth/apple/native/options', 'POST', {}, null))).json();
+		const signedIn = await (
+			await POST(
+				event(
+					'auth/apple/native',
+					'POST',
+					{ challengeId: login.challengeId, identityToken: await identity(login.nonce) },
+					null
+				)
+			)
+		).json();
+		const signedInProfile = await (
+			await GET(event('me', 'GET', undefined, null, { authorization: `Bearer ${signedIn.token}` }))
+		).json();
+		expect(signedInProfile.id).toBe('alice');
+	});
+	test('refuses an Apple identity owned by another account without merging or replacing anything', async () => {
+		const challenge = await options();
+		expect(
+			(await verify(challenge.challengeId, await identity(challenge.nonce, 'apple-bob'))).status
+		).toBe(409);
+		expect((await (await GET(event('me'))).json()).appleUserId).toBeNull();
+		expect((await (await GET(event('me', 'GET', undefined, 'bob'))).json()).appleUserId).toBe(
+			'apple-bob'
+		);
+		expect(snapshot('alice').accounts[0].id).toBe('account-alice');
+	});
+	test('rejects mismatched nonces, other audiences, expired challenges and replay', async () => {
+		for (const kind of ['nonce', 'audience', 'expired']) {
+			const challenge = await options();
+			if (kind === 'expired')
+				db.query('UPDATE challenges SET expires=0 WHERE id=?').run(challenge.challengeId);
+			const token = await identity(
+				kind === 'nonce' ? 'wrong' : challenge.nonce,
+				'apple-relinked',
+				kind === 'audience' ? 'com.other.app' : 'dev.topscrech.Mail-Otter'
+			);
+			expect((await verify(challenge.challengeId, token)).status).not.toBe(200);
+			expect((await verify(challenge.challengeId, token)).status).toBe(400);
+			expect((await (await GET(event('me'))).json()).appleUserId).toBeNull();
+		}
+	});
+	test('binds linking to the original session and separates link challenges from login', async () => {
+		const challenge = await options();
+		db.query('INSERT INTO sessions VALUES (?,?,?,?,?,?)').run(
+			'session-alice-new',
+			'alice',
+			hash('new-session-token'),
+			'Other',
+			new Date().toISOString(),
+			Date.now() + 60_000
+		);
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/link/verify',
+						'POST',
+						{ challengeId: challenge.challengeId, identityToken: await identity(challenge.nonce) },
+						null,
+						{ authorization: 'Bearer new-session-token' }
+					)
+				)
+			).status
+		).toBe(403);
+		const second = await options();
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/link/verify',
+						'POST',
+						{ challengeId: second.challengeId, identityToken: await identity(second.nonce) },
+						'bob'
+					)
+				)
+			).status
+		).toBe(403);
+		const login = await (await POST(event('auth/apple/native/options', 'POST', {}, null))).json();
+		expect((await verify(login.challengeId, await identity(login.nonce))).status).toBe(400);
+		const third = await options();
+		expect(
+			(
+				await POST(
+					event(
+						'auth/apple/native',
+						'POST',
+						{ challengeId: third.challengeId, identityToken: await identity(third.nonce) },
+						null
+					)
+				)
+			).status
+		).toBe(400);
+		expect((await (await GET(event('me'))).json()).appleUserId).toBeNull();
+	});
+	test('does not overwrite an Apple link established while authorization was in progress', async () => {
+		const challenge = await options();
+		db.query('UPDATE users SET apple_sub=? WHERE id=?').run('apple-already-linked', 'alice');
+		expect((await verify(challenge.challengeId, await identity(challenge.nonce))).status).toBe(409);
+		expect((await (await GET(event('me'))).json()).appleUserId).toBe('apple-already-linked');
+	});
+});

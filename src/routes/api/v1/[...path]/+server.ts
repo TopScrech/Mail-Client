@@ -24,6 +24,8 @@ import {
 	appleNativeVerify,
 	passkeyOptions,
 	passkeyVerify,
+	appleLinkOptions,
+	appleLinkVerify,
 	appleUnlinkOptions,
 	appleUnlinkVerify,
 	removePasskey
@@ -134,6 +136,14 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 	if (path === 'events' && method === 'GET') return eventStream(event, auth);
 	if (path === 'sync' && method === 'GET') void processPendingMoves(uid).catch(() => {});
 	if (path === 'me' && method === 'GET') return json(profile(event));
+	if (path === 'auth/apple/link/options' && method === 'POST') {
+		limit(`apple-link:${auth.id}`, 10, 300_000);
+		return json(appleLinkOptions(event));
+	}
+	if (path === 'auth/apple/link/verify' && method === 'POST') {
+		limit(`apple-link-verify:${auth.id}`, 10, 300_000);
+		return json(await appleLinkVerify(event, await body(event)));
+	}
 	if (path === 'auth/apple/unlink/options' && method === 'POST') {
 		limit(`apple-unlink:${auth.id}`, 10, 300_000);
 		return json(await appleUnlinkOptions(event));
