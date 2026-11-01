@@ -36,7 +36,10 @@ import {
 	syncAccount,
 	updateMessage,
 	permanentlyDeleteMessage,
+	permanentlyDeleteMessages,
+	updateMessageFlags,
 	queueMessageMove,
+	queueMessageMoves,
 	processPendingMoves,
 	attachment,
 	send
@@ -304,6 +307,45 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return serialized(uid, async () => {
 			await updateMessage(uid, input.id, change);
 			return json({ ok: true, ...snapshot(uid) });
+		});
+	}
+	if (path === 'messages/bulk' && method === 'PATCH') {
+		limit(`mail-action:${uid}`, 60);
+		const input = await body(event);
+		assert(
+			Array.isArray(input.ids) &&
+				input.ids.length > 0 &&
+				input.ids.length <= 1000 &&
+				input.ids.every((id: unknown) => typeof id === 'string'),
+			'Invalid message selection'
+		);
+		const ids: string[] = [...new Set<string>(input.ids)];
+		if (input.permanentlyDelete !== undefined) {
+			assert(
+				input.permanentlyDelete === true &&
+					input.folder === undefined &&
+					input.read === undefined &&
+					input.starred === undefined,
+				'Permanent deletion cannot be combined with other changes'
+			);
+			return serialized(uid, async () => {
+				const errors = await permanentlyDeleteMessages(uid, ids);
+				return json({ ok: !errors.length, ...snapshot(uid), errors });
+			});
+		}
+		const change: { read?: boolean; starred?: boolean } = {};
+		if (typeof input.read === 'boolean') change.read = input.read;
+		if (typeof input.starred === 'boolean') change.starred = input.starred;
+		if (input.folder) {
+			assert(['inbox', 'archive', 'trash'].includes(input.folder), 'Invalid destination');
+			queueMessageMoves(uid, ids, { ...change, folder: input.folder });
+			void processPendingMoves(uid).catch(() => {});
+			return json({ ok: true, pending: true, ...snapshot(uid) }, { status: 202 });
+		}
+		assert(Object.keys(change).length, 'No message changes');
+		return serialized(uid, async () => {
+			const errors = await updateMessageFlags(uid, ids, change);
+			return json({ ok: !errors.length, ...snapshot(uid), errors });
 		});
 	}
 	if (path === 'attachment' && method === 'GET') {

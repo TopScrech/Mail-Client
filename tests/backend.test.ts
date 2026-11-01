@@ -1125,6 +1125,105 @@ describe('Permanent deletion from Trash', () => {
 		}
 	});
 
+	const bulk = (input: Record<string, unknown>, user: 'alice' | 'bob' = 'alice') =>
+		PATCH(event('messages/bulk', 'PATCH', input, user));
+
+	test('bulk deletion expunges the selected UIDs in one provider call and skips missing IDs', async () => {
+		const state = await fixture();
+		try {
+			const response = await bulk({ ids: ['trashed', 'gone', 'trashed'], permanentlyDelete: true });
+			const result = await response.json();
+			expect(response.status).toBe(200);
+			expect(result.errors).toEqual([]);
+			expect(state.connect).toHaveBeenCalledTimes(1);
+			expect(state.remove).toHaveBeenCalledTimes(1);
+			expect(state.remove).toHaveBeenCalledWith([7], { uid: true });
+			expect(result.messages.map((m: { id: string }) => m.id)).toEqual(['other']);
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('bulk deletion reports provider failures and keeps cached messages', async () => {
+		const state = await fixture({ remains: true });
+		try {
+			const result = await (await bulk({ ids: ['trashed'], permanentlyDelete: true })).json();
+			expect(result.ok).toBe(false);
+			expect(result.errors[0]).toContain('still in Trash');
+			expect(one('SELECT id FROM messages WHERE id=?', 'trashed')).not.toBeNull();
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('bulk deletion ignores other users and rejects messages outside Trash', async () => {
+		const state = await fixture({ folder: 'inbox' });
+		try {
+			await bulk({ ids: ['trashed'], permanentlyDelete: true }, 'bob');
+			const result = await (await bulk({ ids: ['trashed'], permanentlyDelete: true })).json();
+			expect(result.errors).toHaveLength(1);
+			expect(state.remove).not.toHaveBeenCalled();
+			expect(snapshot('alice').messages).toHaveLength(2);
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('bulk flag updates use one provider call for all UIDs', async () => {
+		const state = await fixture();
+		const { ImapFlow } = await import('imapflow');
+		const add = spyOn(ImapFlow.prototype, 'messageFlagsAdd').mockResolvedValue(true);
+		try {
+			const result = await (await bulk({ ids: ['trashed', 'other'], read: true })).json();
+			expect(result.errors).toEqual([]);
+			expect(state.connect).toHaveBeenCalledTimes(1);
+			expect(add).toHaveBeenCalledTimes(1);
+			expect(add).toHaveBeenCalledWith([7, 8], ['\\Seen'], { uid: true });
+			expect(result.messages.every((m: { read: boolean }) => m.read)).toBe(true);
+		} finally {
+			add.mockRestore();
+			state.restore();
+		}
+	});
+
+	test('bulk moves are hidden in one response without waiting for the provider', async () => {
+		const { processPendingMoves } = await import('../src/lib/server/mail');
+		const state = await fixture();
+		const worker = spyOn(
+			(await import('imapflow')).ImapFlow.prototype,
+			'messageMove'
+		).mockResolvedValue(false as never);
+		try {
+			const response = await bulk({ ids: ['trashed', 'other', 'gone'], folder: 'archive' });
+			expect(response.status).toBe(202);
+			expect((await response.json()).messages).toEqual([]);
+		} finally {
+			await processPendingMoves('alice').catch(() => {});
+			worker.mockRestore();
+			state.restore();
+		}
+	});
+
+	test('bulk requests reject invalid selections and conflicting changes before connecting', async () => {
+		const state = await fixture();
+		try {
+			for (const input of [
+				{ ids: [], read: true },
+				{ ids: 'trashed', read: true },
+				{ ids: [1], read: true },
+				{ ids: Array(1001).fill('trashed'), read: true },
+				{ ids: ['trashed'] },
+				{ ids: ['trashed'], folder: 'sent' },
+				{ ids: ['trashed'], permanentlyDelete: false },
+				{ ids: ['trashed'], permanentlyDelete: true, read: true }
+			])
+				expect((await bulk(input)).status).toBe(400);
+			expect(state.connect).not.toHaveBeenCalled();
+		} finally {
+			state.restore();
+		}
+	});
+
 	test('ownership, Trash membership, explicit intent and conflicting changes are checked before connecting', async () => {
 		const state = await fixture({ folder: 'inbox' });
 		try {

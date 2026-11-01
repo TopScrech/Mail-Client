@@ -63,6 +63,7 @@ Linking never merges accounts, creates a workspace, changes mail data, or replac
 | DELETE | `/accounts/:id`                        | Disconnects from all devices and removes cached mail and associated drafts — provider mail is untouched                               |
 | POST   | `/mail/sync`                           | `{ accountId? }` — synchronizes one or all owned accounts and returns the snapshot plus an `errors` array                             |
 | PATCH  | `/messages`                            | `{ id, read?, starred?, folder? }` — destination folder is `inbox`, `archive`, or `trash`                                             |
+| PATCH  | `/messages/bulk`                       | `{ ids, read?, starred?, folder?, permanentlyDelete? }` — applies one change to up to 1000 messages, using one provider connection per account |
 | GET    | `/attachment?id=<messageId>&index=<n>` | Downloads one attachment as an opaque file                                                                                            |
 | PUT    | `/drafts`                              | `{ draft }` — `updatedAt` is empty for a new draft, or the timestamp from the last fetched version                                    |
 | DELETE | `/drafts/:id`                          | Removes an owned draft                                                                                                                |
@@ -95,6 +96,8 @@ For Google and Microsoft accounts, repeat the mail OAuth flow with the same emai
 Flag updates return `{ ok: true, ...Snapshot }` after provider confirmation
 
 Moves return HTTP 202 with `{ ok: true, pending: true, ...Snapshot }` after saving the intent in the database — pending messages stay hidden across refreshes and mailbox syncs while the provider completes the move
+
+Bulk flag updates and permanent deletions return `{ ok, errors, ...Snapshot }` — a provider failure only affects its own account and folder, and `errors` describes it — bulk moves are queued like single moves and return HTTP 202
 
 Background reconciliation and sync requests resume persisted moves after a server restart — a failed move restores the cached message and records an account warning
 

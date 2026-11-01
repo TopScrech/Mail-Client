@@ -900,6 +900,154 @@ export async function permanentlyDeleteMessage(userId: string, id: string) {
 	}
 }
 
+function groupBy<T>(items: T[], key: (item: T) => string) {
+	const groups = new Map<string, T[]>();
+	for (const item of items) {
+		const group = groups.get(key(item));
+		if (group) group.push(item);
+		else groups.set(key(item), [item]);
+	}
+	return [...groups.values()];
+}
+function hasPendingMove(userId: string, id: string) {
+	return !!one('SELECT message_id FROM pending_moves WHERE message_id=? AND user_id=?', id, userId);
+}
+function cachedMessages(userId: string, ids: string[]) {
+	return ids.flatMap((id) => {
+		const row = one<{ data: string }>(
+			'SELECT data FROM messages WHERE id=? AND user_id=?',
+			id,
+			userId
+		);
+		return row ? [JSON.parse(row.data) as Message] : [];
+	});
+}
+/** Opens one connection per account and one mailbox lock per folder, so a failure only affects its own group */
+async function forEachMailbox(
+	userId: string,
+	mails: Message[],
+	action: (client: ImapFlow, group: Message[]) => Promise<void>
+) {
+	const errors = new Set<string>();
+	const record = (error: unknown) =>
+		errors.add(error instanceof Error ? error.message : 'Could not update messages — try again');
+	for (const accountMails of groupBy(mails, (mail) => mail.accountId)) {
+		try {
+			const { data, credentials } = await authorizedAccount(userId, accountMails[0].accountId);
+			const client = imap(data, credentials);
+			try {
+				await connectImap(client, userId, data.id);
+				for (const group of groupBy(accountMails, (mail) => `${mail.uidValidity}:${mail.path}`)) {
+					try {
+						const lock = await client.getMailboxLock(group[0].path);
+						try {
+							assert(
+								client.mailbox && client.mailbox.uidValidity.toString() === group[0].uidValidity,
+								'Mailbox changed — sync and try again',
+								409
+							);
+							await action(client, group);
+						} finally {
+							lock.release();
+						}
+					} catch (error) {
+						record(error);
+					}
+				}
+			} finally {
+				await client.logout().catch(() => {});
+			}
+		} catch (error) {
+			record(error);
+		}
+	}
+	return [...errors];
+}
+export function queueMessageMoves(
+	userId: string,
+	ids: string[],
+	change: { read?: boolean; starred?: boolean; folder: Folder }
+) {
+	db.transaction(() => {
+		for (const mail of cachedMessages(userId, ids))
+			db.query(
+				'INSERT INTO pending_moves VALUES (?,?,?,?,?) ON CONFLICT(message_id) DO NOTHING'
+			).run(mail.id, userId, mail.accountId, JSON.stringify(change), JSON.stringify(mail));
+		bump(userId);
+	})();
+}
+export function updateMessageFlags(
+	userId: string,
+	ids: string[],
+	change: { read?: boolean; starred?: boolean }
+) {
+	const mails = cachedMessages(userId, ids).filter((mail) => !hasPendingMove(userId, mail.id));
+	return forEachMailbox(userId, mails, async (client, group) => {
+		const uids = group.map((mail) => mail.uid);
+		const flags = async (flag: string, enabled: boolean) => {
+			if (enabled) await client.messageFlagsAdd(uids, [flag], { uid: true });
+			else await client.messageFlagsRemove(uids, [flag], { uid: true });
+		};
+		if (typeof change.read === 'boolean') await flags('\\Seen', change.read);
+		if (typeof change.starred === 'boolean') await flags('\\Flagged', change.starred);
+		db.transaction(() => {
+			for (const mail of cachedMessages(
+				userId,
+				group.map((item) => item.id)
+			))
+				db.query('UPDATE messages SET data=? WHERE id=? AND user_id=?').run(
+					JSON.stringify({ ...mail, ...change }),
+					mail.id,
+					userId
+				);
+			bump(userId);
+		})();
+	});
+}
+export async function permanentlyDeleteMessages(userId: string, ids: string[]) {
+	const mails = cachedMessages(userId, ids);
+	const deletable = mails.filter(
+		(mail) => mail.folder === 'trash' && !hasPendingMove(userId, mail.id)
+	);
+	const present = async (client: ImapFlow, uids: number[]) => {
+		const found = await client.fetchAll(uids, { uid: true }, { uid: true });
+		return found.map((item) => item.uid).filter((uid) => uids.includes(uid));
+	};
+	const errors = await forEachMailbox(userId, deletable, async (client, group) => {
+		const uids = await present(
+			client,
+			group.map((mail) => mail.uid)
+		);
+		if (uids.length) {
+			assert(
+				client.capabilities.has('UIDPLUS') ||
+					client.enabled.has('IMAP4REV2') ||
+					(client.capabilities.has('IMAP4rev2') && !client.capabilities.has('IMAP4rev1')),
+				'Your mail server does not support safely deleting individual messages permanently',
+				422
+			);
+			assert(
+				await client.messageDelete(uids, { uid: true }),
+				'The mail server could not permanently delete these messages — try again',
+				502
+			);
+			assert(
+				!(await present(client, uids)).length,
+				'Some messages are still in Trash — permanent deletion could not be confirmed',
+				502
+			);
+		}
+		db.transaction(() => {
+			for (const mail of group)
+				db.query('DELETE FROM messages WHERE id=? AND user_id=?').run(mail.id, userId);
+			bump(userId);
+		})();
+	});
+	if (deletable.length < mails.length)
+		errors.push('Only messages in Trash with no pending move can be permanently deleted');
+	return errors;
+}
+
 export async function attachment(userId: string, id: string, index: number) {
 	const mail = message(userId, id);
 	assert(
