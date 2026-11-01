@@ -74,9 +74,20 @@ export function startMailWorker() {
 		worker.scan();
 		bodies.scan();
 	});
+	const retryMoves = () => {
+		for (const { user_id } of all<{ user_id: string }>(
+			'SELECT DISTINCT user_id FROM pending_moves'
+		)) {
+			void processPendingMoves(user_id).catch(() => {});
+		}
+	};
+	retryMoves();
+	const moveTimer = setInterval(retryMoves, 30_000);
+	moveTimer.unref?.();
 	worker.start();
 	bodies.start();
 	return () => {
+		clearInterval(moveTimer);
 		unsubscribe();
 		worker.stop();
 		bodies.stop();
