@@ -960,6 +960,7 @@ describe('Message move reconciliation', () => {
 			await processPendingMoves('alice');
 			expect(snapshot('alice').revision).toBeGreaterThan(revision);
 			expect(snapshot('alice').accounts[0].error).toContain('retry automatically');
+			expect(snapshot('alice').accounts[0].error).toContain('Provider unavailable');
 			expect(one('SELECT message_id FROM pending_moves')).not.toBeNull();
 			expect(snapshot('alice').messages).toEqual([]);
 			expect((await (await GET(event('sync'))).json()).messages).toEqual([]);
@@ -978,6 +979,7 @@ describe('Message move reconciliation', () => {
 			await processPendingMoves('alice');
 			expect(snapshot('alice').messages[0].folder).toBe('trash');
 			expect(snapshot('alice').accounts[0].error).toBeNull();
+			expect(snapshot('alice').accounts[0].actionError).toBeNull();
 			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
 			expect(one('SELECT message_id FROM pending_move_retries')).toBeNull();
 		} finally {
@@ -1090,6 +1092,7 @@ describe('Message move reconciliation', () => {
 			await processPendingMoves('alice');
 			expect(snapshot('alice').messages[0].id).toBe('moving');
 			expect(snapshot('alice').accounts[0].error).toContain('does not expose a trash folder');
+			expect(snapshot('alice').accounts[0].actionError).toContain('does not expose a trash folder');
 			expect(one('SELECT message_id FROM pending_moves')).toBeNull();
 		} finally {
 			restore();
@@ -1108,6 +1111,65 @@ describe('Message move reconciliation', () => {
 		} finally {
 			restore();
 		}
+	});
+});
+
+describe('Background sync error reporting', () => {
+	test('provider failures appear in snapshots with the original reason and account ownership', async () => {
+		const { recordSyncFailure } = await import('../src/lib/server/mail');
+		const revision = snapshot('alice').revision;
+		recordSyncFailure('alice', 'account-alice', new Error('Connection timed out'));
+		expect(snapshot('alice').accounts[0].error).toContain('Connection timed out');
+		expect(snapshot('alice').revision).toBeGreaterThan(revision);
+		expect(snapshot('bob').accounts[0].error).toBeUndefined();
+		const reported = snapshot('alice').revision;
+		recordSyncFailure('alice', 'account-alice', new Error('Connection timed out'));
+		expect(snapshot('alice').revision).toBe(reported);
+		recordSyncFailure('bob', 'account-alice', new Error('Wrong owner'));
+		expect(snapshot('alice').accounts[0].error).toContain('Connection timed out');
+	});
+
+	test('successful mailbox sync retains a failed deletion reason for the next app refresh', async () => {
+		const { syncAccount } = await import('../src/lib/server/mail');
+		const { ImapFlow } = await import('imapflow');
+		const actionError =
+			'A message could not be moved — Your mail server does not expose a trash folder';
+		const data = {
+			...snapshot('alice').accounts[0],
+			imapHost: 'imap.mail.me.com',
+			error: actionError,
+			actionError
+		};
+		db.query('UPDATE accounts SET data=?,secret=? WHERE id=?').run(
+			JSON.stringify(data),
+			encrypt(JSON.stringify({ username: data.email, password: 'test' }), 'alice:account-alice'),
+			data.id
+		);
+		const mocks = [
+			spyOn(ImapFlow.prototype, 'connect').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'list').mockResolvedValue([])
+		];
+		try {
+			await syncAccount('alice', data.id);
+			expect(snapshot('alice').accounts[0].error).toBeNull();
+			expect(snapshot('alice').accounts[0].actionError).toBe(actionError);
+			expect((await (await GET(event('sync'))).json()).accounts[0].actionError).toBe(actionError);
+		} finally {
+			mocks.forEach((mock) => mock.mockRestore());
+		}
+	});
+
+	test('authentication failures retain their reconnect guidance', async () => {
+		const { recordSyncFailure } = await import('../src/lib/server/mail');
+		recordSyncFailure(
+			'alice',
+			'account-alice',
+			Object.assign(new Error('Login rejected'), { authenticationFailed: true })
+		);
+		expect(snapshot('alice').accounts[0].reconnectRequired).toBe(true);
+		recordSyncFailure('alice', 'account-alice', new Error('Connection lost'));
+		expect(snapshot('alice').accounts[0].error).toContain('reconnect');
 	});
 });
 

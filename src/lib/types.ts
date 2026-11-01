@@ -8,6 +8,7 @@ export interface MailAccount {
 	smtpPort: number;
 	lastSync: string | null;
 	error: string | null;
+	actionError?: string | null;
 	reconnectRequired?: boolean;
 	color?: AccountColor | null;
 }

@@ -59,6 +59,32 @@ export function recordAuthFailure(userId: string, id: string, error: unknown) {
 		bump(userId);
 	})();
 }
+export function recordSyncFailure(userId: string, id: string, error: unknown) {
+	if (isMailAuthError(error)) {
+		recordAuthFailure(userId, id, error);
+		return;
+	}
+	const row = one<{ data: string }>(
+		'SELECT data FROM accounts WHERE id=? AND user_id=?',
+		id,
+		userId
+	);
+	if (!row) return;
+	const data: MailAccount = JSON.parse(row.data);
+	if (data.reconnectRequired) return;
+	const message = `Could not sync this account — ${error instanceof Error ? error.message : 'Unknown provider error'}`;
+	if (data.error === message) return;
+	data.error = message;
+	db.transaction(() => {
+		db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
+			JSON.stringify(data),
+			id,
+			userId
+		);
+		bump(userId);
+	})();
+}
+
 async function authorizedAccount(userId: string, id: string) {
 	const result = account(userId, id);
 	try {
@@ -598,7 +624,7 @@ export async function syncAccount(userId: string, id: string) {
 		})();
 	} catch (error) {
 		if (isMailAuthError(error)) throw new MailAuthError();
-		data.error = 'Could not sync this account — check your connection or reconnect the account';
+		data.error = `Could not sync this account — ${error instanceof Error ? error.message : 'check your connection or reconnect the account'}`;
 		db.transaction(() => {
 			const latest = one<{ data: string }>(
 				'SELECT data FROM accounts WHERE id=? AND user_id=?',
@@ -672,6 +698,7 @@ export function processPendingMoves(userId: string): Promise<void> {
 			))
 		) {
 			let retry = false;
+			let completed = false;
 			try {
 				await updateMessage(
 					userId,
@@ -679,6 +706,7 @@ export function processPendingMoves(userId: string): Promise<void> {
 					JSON.parse(move.changes),
 					JSON.parse(move.message)
 				);
+				completed = true;
 			} catch (error) {
 				// Keep intent across outages and authentication renewal, including process restarts
 				retry =
@@ -691,11 +719,10 @@ export function processPendingMoves(userId: string): Promise<void> {
 				);
 				if (row) {
 					const data: MailAccount = JSON.parse(row.data);
-					if (!data.reconnectRequired) {
-						data.error = retry
-							? pendingMoveError
-							: `A message could not be moved — ${error instanceof Error ? error.message : 'try again'}`;
-					}
+					data.actionError = retry
+						? `${pendingMoveError}: ${error instanceof Error ? error.message : 'Unknown provider error'}`
+						: `A message could not be moved — ${error instanceof Error ? error.message : 'try again'}`;
+					if (!data.reconnectRequired) data.error = data.actionError;
 					db.transaction(() => {
 						if (!retry)
 							db.query('INSERT INTO messages VALUES (?,?,?,?) ON CONFLICT(id) DO NOTHING').run(
@@ -738,8 +765,10 @@ export function processPendingMoves(userId: string): Promise<void> {
 							)
 						) {
 							const data: MailAccount = JSON.parse(owner.data);
-							if (data.error === pendingMoveError) {
-								data.error = null;
+							if (completed && (data.actionError || data.error?.startsWith(pendingMoveError))) {
+								if (data.error === data.actionError || data.error?.startsWith(pendingMoveError))
+									data.error = null;
+								data.actionError = null;
 								db.query('UPDATE accounts SET data=? WHERE id=? AND user_id=?').run(
 									JSON.stringify(data),
 									move!.account_id,

@@ -5,7 +5,7 @@ import { BodyWorker } from './body-worker';
 import {
 	idleClient,
 	processPendingMoves,
-	recordAuthFailure,
+	recordSyncFailure,
 	serialized,
 	syncAccount,
 	syncInbox,
@@ -68,7 +68,14 @@ export function startMailWorker() {
 				}
 			});
 		},
-		failed: (account, error) => recordAuthFailure(account.userId, account.id, error)
+		failed(account, error) {
+			const current = one<{ secret: string }>(
+				'SELECT secret FROM accounts WHERE id=? AND user_id=?',
+				account.id,
+				account.userId
+			);
+			if (current?.secret === account.version) recordSyncFailure(account.userId, account.id, error);
+		}
 	});
 	const unsubscribe = subscribeChanges(() => {
 		worker.scan();
