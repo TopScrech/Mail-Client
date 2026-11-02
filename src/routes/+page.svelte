@@ -274,29 +274,37 @@
 		mobileReading = true;
 		if (!message.read) await changeMessage({ read: true }, message);
 	}
+	function selectAfterMove(message: Message, destination: string) {
+		if (selected !== message.id) return;
+		const index = messages.findIndex((item) => item.id === message.id);
+		const next =
+			destination === 'trash' && index !== -1
+				? messages[index + 1] || messages[index - 1]
+				: undefined;
+		if (next) {
+			void selectMessage(next);
+		} else {
+			selected = '';
+			mobileReading = false;
+		}
+	}
 	async function changeMessage(
 		change: { read?: boolean; starred?: boolean; folder?: string },
 		message = active
 	) {
 		if (!message || busy) return;
 		if (demo) {
+			if (change.folder) selectAfterMove(message, change.folder);
 			mailbox.messages = mailbox.messages.map((m) =>
 				m.id === message.id ? ({ ...m, ...change } as Message) : m
 			);
-			if (change.folder) {
-				selected = '';
-				mobileReading = false;
-			}
 			return;
 		}
 		if (pendingMoves[message.id] || !profile) return;
 		const userId = profile.id;
 		if (change.folder) {
+			selectAfterMove(message, change.folder);
 			pendingMoves[message.id] = true;
-			if (selected === message.id) {
-				selected = '';
-				mobileReading = false;
-			}
 		}
 		const previous = change.folder
 			? Promise.resolve()
