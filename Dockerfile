@@ -4,7 +4,7 @@ COPY package.json bun.lock ./
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     NODE_ENV=development bun install --frozen-lockfile
 # Only application inputs invalidate the build layer
-COPY svelte.config.js vite.config.ts tsconfig.json ./
+COPY vite.config.ts tsconfig.json ./
 COPY src ./src
 COPY static ./static
 RUN bun run build
