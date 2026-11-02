@@ -42,6 +42,7 @@ import {
 	queueMessageMoves,
 	processPendingMoves,
 	attachment,
+	messageSource,
 	send
 } from '$lib/server/mail';
 import type { Draft, Folder } from '$lib/types';
@@ -346,6 +347,19 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		return serialized(uid, async () => {
 			const errors = await updateMessageFlags(uid, ids, change);
 			return json({ ok: !errors.length, ...snapshot(uid), errors });
+		});
+	}
+	if (path === 'messages/source' && method === 'GET') {
+		limit(`message-source:${uid}`, 30);
+		const source = await serialized(uid, () =>
+			messageSource(uid, event.url.searchParams.get('id') || '')
+		);
+		return new Response(new Uint8Array(source), {
+			headers: {
+				'content-type': 'text/plain; charset=utf-8',
+				'cache-control': 'no-store',
+				'x-content-type-options': 'nosniff'
+			}
 		});
 	}
 	if (path === 'attachment' && method === 'GET') {

@@ -65,6 +65,7 @@ Linking never merges accounts, creates a workspace, changes mail data, or replac
 | PATCH  | `/messages`                            | `{ id, read?, starred?, folder? }` — destination folder is `inbox`, `archive`, or `trash`                                             |
 | PATCH  | `/messages/bulk`                       | `{ ids, read?, starred?, folder?, permanentlyDelete? }` — applies one change to up to 1000 messages, using one provider connection per account |
 | GET    | `/attachment?id=<messageId>&index=<n>` | Downloads one attachment as an opaque file                                                                                            |
+| GET    | `/messages/source?id=<messageId>` | Downloads the original email source with all headers and the complete MIME body for debugging, up to 20 MB, without caching |
 | PUT    | `/drafts`                              | `{ draft }` — `updatedAt` is empty for a new draft, or the timestamp from the last fetched version                                    |
 | DELETE | `/drafts/:id`                          | Removes an owned draft                                                                                                                |
 | POST   | `/send`                                | Multipart: `draft` as JSON, `requestId` as a UUID, and optional repeated `files` fields                                               |

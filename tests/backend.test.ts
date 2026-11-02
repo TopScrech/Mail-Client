@@ -2383,3 +2383,118 @@ describe('Linking Sign in with Apple', () => {
 		expect((await (await GET(event('me'))).json()).appleUserId).toBe('apple-already-linked');
 	});
 });
+
+describe('Debug email source', () => {
+	async function setup(
+		options: { changedMailbox?: boolean; size?: number; missing?: boolean } = {}
+	) {
+		const { ImapFlow } = await import('imapflow');
+		const data = { ...snapshot('alice').accounts[0], imapHost: 'imap.mail.me.com' };
+		db.query('UPDATE accounts SET data=?,secret=? WHERE id=?').run(
+			JSON.stringify(data),
+			encrypt(JSON.stringify({ username: data.email, password: 'test' }), 'alice:account-alice'),
+			data.id
+		);
+		db.query('INSERT INTO messages VALUES (?,?,?,?)').run(
+			'debug-mail',
+			'alice',
+			data.id,
+			JSON.stringify({
+				id: 'debug-mail',
+				accountId: data.id,
+				path: 'INBOX',
+				uid: 7,
+				uidValidity: '1'
+			})
+		);
+		const source =
+			'Received: first\r\nReceived: second\r\nX-Debug: original\r\nContent-Type: text/html\r\n\r\n<p>Complete body</p>';
+		let released = false;
+		const fetch = spyOn(ImapFlow.prototype, 'fetchOne').mockImplementation(
+			async (_uid, query, flags) => {
+				expect(_uid).toBe(7);
+				expect(flags?.uid).toBe(true);
+				if (options.missing) return false;
+				return (
+					query?.size ? { size: options.size ?? source.length } : { source: Buffer.from(source) }
+				) as never;
+			}
+		);
+		const logout = spyOn(ImapFlow.prototype, 'logout').mockResolvedValue(undefined);
+		const mocks = [
+			fetch,
+			logout,
+			spyOn(ImapFlow.prototype, 'connect').mockResolvedValue(undefined),
+			spyOn(ImapFlow.prototype, 'getMailboxLock').mockImplementation(async function (
+				this: InstanceType<typeof ImapFlow>
+			) {
+				this.mailbox = { uidValidity: options.changedMailbox ? 2n : 1n } as never;
+				return {
+					release() {
+						released = true;
+					}
+				} as never;
+			})
+		];
+		return {
+			source,
+			fetch,
+			logout,
+			released: () => released,
+			restore: () => mocks.forEach((mock) => mock.mockRestore())
+		};
+	}
+
+	test('copies every original header and the full body without caching or marking read', async () => {
+		const state = await setup();
+		try {
+			const flags = spyOn((await import('imapflow')).ImapFlow.prototype, 'messageFlagsAdd');
+			try {
+				const response = await GET(event('messages/source?id=debug-mail'));
+				expect(response.status).toBe(200);
+				expect(response.headers.get('cache-control')).toBe('no-store');
+				expect(await response.text()).toBe(state.source);
+				expect(flags).not.toHaveBeenCalled();
+				expect(state.released()).toBe(true);
+				expect(state.logout).toHaveBeenCalledTimes(1);
+			} finally {
+				flags.mockRestore();
+			}
+		} finally {
+			state.restore();
+		}
+	});
+
+	test('requires authentication and message ownership before contacting the provider', async () => {
+		const state = await setup();
+		try {
+			expect(
+				(await GET(event('messages/source?id=debug-mail', 'GET', undefined, null))).status
+			).toBe(401);
+			expect(
+				(await GET(event('messages/source?id=debug-mail', 'GET', undefined, 'bob'))).status
+			).toBe(404);
+			expect(state.fetch).not.toHaveBeenCalled();
+		} finally {
+			state.restore();
+		}
+	});
+
+	for (const [options, status] of [
+		[{ changedMailbox: true }, 409],
+		[{ size: 21 * 1024 * 1024 }, 413],
+		[{ missing: true }, 404]
+	] as const) {
+		test(`rejects unavailable or oversized source with ${status} and releases the connection`, async () => {
+			const state = await setup(options);
+			try {
+				expect((await GET(event('messages/source?id=debug-mail'))).status).toBe(status);
+				expect(state.fetch.mock.calls.length).toBe(status === 409 ? 0 : 1);
+				expect(state.released()).toBe(true);
+				expect(state.logout).toHaveBeenCalledTimes(1);
+			} finally {
+				state.restore();
+			}
+		});
+	}
+});

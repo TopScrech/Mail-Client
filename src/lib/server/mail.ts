@@ -1049,6 +1049,37 @@ export async function permanentlyDeleteMessages(userId: string, ids: string[]) {
 	return errors;
 }
 
+export async function messageSource(userId: string, id: string) {
+	const mail = message(userId, id);
+	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
+	const client = imap(data, credentials);
+	try {
+		await connectImap(client, userId, data.id);
+		const lock = await client.getMailboxLock(mail.path);
+		try {
+			assert(
+				client.mailbox && client.mailbox.uidValidity.toString() === mail.uidValidity,
+				'Mailbox changed — sync and try again',
+				409
+			);
+			const metadata = await client.fetchOne(mail.uid, { size: true }, { uid: true });
+			assert(metadata, 'Message no longer exists', 404);
+			assert(
+				metadata.size !== undefined && metadata.size <= 20 * 1024 * 1024,
+				'Message exceeds the 20 MB debug copy limit',
+				413
+			);
+			const source = await client.fetchOne(mail.uid, { source: true }, { uid: true });
+			assert(source && source.source, 'Message no longer exists', 404);
+			return source.source;
+		} finally {
+			lock.release();
+		}
+	} finally {
+		await client.logout().catch(() => {});
+	}
+}
+
 export async function attachment(userId: string, id: string, index: number) {
 	const mail = message(userId, id);
 	assert(
