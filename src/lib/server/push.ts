@@ -58,6 +58,24 @@ export function unregisterPushDevice(session: Session, input: unknown) {
 	);
 }
 
+function inboxUIDIdentity(message: Message) {
+	return `uid:${message.uidValidity}:${message.uid}`;
+}
+function inboxMessageIdentity(message: Message) {
+	const identity = message.messageId
+		? ['message-id', message.messageId]
+		: ['envelope', message.fromAddress, message.to, message.subject, message.date];
+	return `message:${createHash('sha256').update(JSON.stringify(identity)).digest('hex')}`;
+}
+
+// Called only after a successful move, in the same transaction as the cached message update
+export function silenceMovedInboxMessage(original: Message, moved?: Message) {
+	db.query('INSERT OR IGNORE INTO push_silent_arrivals (account_id,identity) VALUES (?,?)').run(
+		original.accountId,
+		moved ? inboxUIDIdentity(moved) : inboxMessageIdentity(original)
+	);
+}
+
 // Called inside the mailbox transaction so the watermark and jobs commit together
 export function queueInboxPushes(
 	userId: string,
@@ -70,6 +88,21 @@ export function queueInboxPushes(
 		accountId
 	);
 	const maximum = Math.max(0, ...messages.map((message) => message.uid));
+	const silent = new Set(
+		all<{ identity: string }>(
+			'SELECT identity FROM push_silent_arrivals WHERE account_id=?',
+			accountId
+		).map((row) => row.identity)
+	);
+	const consumed = new Set<string>();
+	const silentMessageIDs = new Set<string>();
+	for (const message of messages) {
+		const uidIdentity = inboxUIDIdentity(message);
+		const messageIdentity = inboxMessageIdentity(message);
+		if (silent.has(uidIdentity) || silent.has(messageIdentity)) silentMessageIDs.add(message.id);
+		if (silent.has(uidIdentity)) consumed.add(uidIdentity);
+		if (silent.has(messageIdentity)) consumed.add(messageIdentity);
+	}
 	if (previous?.validity === validity) {
 		const devices = all<{ id: string }>(
 			`SELECT d.id FROM push_devices d JOIN sessions s ON s.id=d.session_id WHERE s.user_id=? AND s.expires>?`,
@@ -77,13 +110,34 @@ export function queueInboxPushes(
 			Date.now()
 		);
 		for (const message of messages) {
-			if (message.uid <= previous.uid || message.read || message.folder !== 'inbox') continue;
+			if (
+				message.uid <= previous.uid ||
+				message.read ||
+				message.folder !== 'inbox' ||
+				silentMessageIDs.has(message.id)
+			)
+				continue;
 			for (const device of devices)
 				db.query(
 					'INSERT OR IGNORE INTO push_jobs (device_id,message_id,created_at) VALUES (?,?,?)'
 				).run(device.id, message.id, Date.now());
 		}
 	}
+	// Retire exact UID markers once the watermark covers them, including arrivals outside the cached window
+	for (const identity of silent) {
+		if (!identity.startsWith('uid:')) continue;
+		const [, markerValidity, uid] = identity.split(':');
+		if (
+			markerValidity !== validity ||
+			Number(uid) <= Math.max(previous?.validity === validity ? previous.uid : 0, maximum)
+		)
+			consumed.add(identity);
+	}
+	for (const identity of consumed)
+		db.query('DELETE FROM push_silent_arrivals WHERE account_id=? AND identity=?').run(
+			accountId,
+			identity
+		);
 	// First sync and UIDVALIDITY resets establish a baseline without alerting for old mail
 	db.query(
 		`INSERT INTO push_checkpoints VALUES (?,?,?) ON CONFLICT(account_id) DO UPDATE SET validity=excluded.validity,uid=excluded.uid`

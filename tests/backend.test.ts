@@ -866,7 +866,7 @@ describe('Mail account reconnection', () => {
 });
 
 describe('Message move reconciliation', () => {
-	async function mockMove(failure = false) {
+	async function mockMove(failure = false, mapsUID = true) {
 		const { ImapFlow } = await import('imapflow');
 		const data = {
 			...snapshot('alice').accounts[0],
@@ -909,7 +909,12 @@ describe('Message move reconciliation', () => {
 			}),
 			spyOn(ImapFlow.prototype, 'messageMove').mockImplementation(async () => {
 				if (failure) throw new Error('Provider unavailable');
-				return { path: 'INBOX', destination: 'Trash', uidValidity: 2n, uidMap: new Map([[7, 42]]) };
+				return {
+					path: 'INBOX',
+					destination: 'Trash',
+					uidValidity: 2n,
+					uidMap: mapsUID ? new Map([[7, 42]]) : undefined
+				};
 			})
 		];
 		return () => mocks.forEach((mock) => mock.mockRestore());
@@ -982,6 +987,42 @@ describe('Message move reconciliation', () => {
 			restore();
 		}
 	});
+	for (const { failure, mapsUID } of [
+		{ failure: false, mapsUID: true },
+		{ failure: false, mapsUID: false },
+		{ failure: true, mapsUID: true }
+	]) {
+		test(`restoring from Trash records a silent arrival only after a successful provider move: failure=${failure}, mapping=${mapsUID}`, async () => {
+			const restore = await mockMove(failure, mapsUID);
+			const { updateMessage } = await import('../src/lib/server/mail');
+			db.query(
+				"UPDATE messages SET data=json_set(data,'$.folder','trash','$.path','Trash') WHERE id=?"
+			).run('moving');
+			try {
+				if (failure) {
+					await expect(updateMessage('alice', 'moving', { folder: 'inbox' })).rejects.toThrow(
+						'Provider unavailable'
+					);
+					expect(one('SELECT identity FROM push_silent_arrivals')).toBeNull();
+				} else {
+					await updateMessage('alice', 'moving', { folder: 'inbox' });
+					const identity = one<{ identity: string }>(
+						'SELECT identity FROM push_silent_arrivals WHERE account_id=?',
+						'account-alice'
+					)?.identity;
+					if (mapsUID) {
+						expect(identity).toBe('uid:2:42');
+						expect(snapshot('alice').messages[0].folder).toBe('inbox');
+					} else {
+						expect(identity).toStartWith('message:');
+					}
+				}
+			} finally {
+				restore();
+			}
+		});
+	}
+
 	test('users cannot queue moves for another user’s messages', async () => {
 		const restore = await mockMove();
 		try {
@@ -1900,6 +1941,68 @@ describe('Push notifications', () => {
 		queueInboxPushes('alice', 'account-alice', '2', [save(4)]);
 		expect(one<{ count: number }>('SELECT count(*) count FROM push_jobs')?.count).toBe(1);
 	});
+	test('restoring an unread message is silent while real mail before and after it still queues pushes', async () => {
+		const { queueInboxPushes, silenceMovedInboxMessage } = await setup();
+		queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+		const restored = save(3);
+		silenceMovedInboxMessage({ ...restored, folder: 'trash', path: 'Trash', uid: 90 }, restored);
+		// This marker is durable database state, independent of the HTTP request and process memory
+		expect(one('SELECT identity FROM push_silent_arrivals')).not.toBeNull();
+		const messages = [save(2), restored, save(4)];
+		queueInboxPushes('alice', 'account-alice', '1', messages);
+		expect(db.query('SELECT message_id FROM push_jobs ORDER BY message_id').all()).toEqual([
+			{ message_id: 'push-2' },
+			{ message_id: 'push-4' }
+		]);
+		expect(
+			one<{ uid: number }>('SELECT uid FROM push_checkpoints WHERE account_id=?', 'account-alice')
+				?.uid
+		).toBe(4);
+		expect(one('SELECT identity FROM push_silent_arrivals')).toBeNull();
+		queueInboxPushes('alice', 'account-alice', '1', messages);
+		expect(one<{ count: number }>('SELECT count(*) count FROM push_jobs')?.count).toBe(2);
+	});
+
+	for (const missingMessageID of [false, true]) {
+		test(`a provider without destination UID mapping still restores silently: missing Message-ID=${missingMessageID}`, async () => {
+			const { queueInboxPushes, silenceMovedInboxMessage } = await setup();
+			queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+			const restored = { ...save(3), ...(missingMessageID ? { messageId: '' } : {}) };
+			db.query('UPDATE messages SET data=? WHERE id=?').run(JSON.stringify(restored), restored.id);
+			silenceMovedInboxMessage({ ...restored, path: 'Trash', folder: 'trash', uid: 90 });
+			queueInboxPushes('alice', 'account-alice', '1', [save(2), restored]);
+			expect(db.query('SELECT message_id FROM push_jobs').all()).toEqual([
+				{ message_id: 'push-2' }
+			]);
+			expect(one('SELECT identity FROM push_silent_arrivals')).toBeNull();
+		});
+	}
+
+	test('silent restoration markers are isolated by account and removed on account disconnect', async () => {
+		const { queueInboxPushes, silenceMovedInboxMessage } = await setup();
+		queueInboxPushes('alice', 'account-alice', '1', [save(1)]);
+		const incoming = save(2);
+		silenceMovedInboxMessage({ ...incoming, accountId: 'account-bob', folder: 'trash' });
+		queueInboxPushes('alice', 'account-alice', '1', [incoming]);
+		expect(one('SELECT message_id FROM push_jobs')).not.toBeNull();
+		db.query('DELETE FROM accounts WHERE id=?').run('account-bob');
+		expect(one('SELECT identity FROM push_silent_arrivals')).toBeNull();
+	});
+
+	test('UID markers cannot suppress mail after a UIDVALIDITY reset or grow after their UID is passed', async () => {
+		const { queueInboxPushes, silenceMovedInboxMessage } = await setup();
+		const moved = message(3);
+		silenceMovedInboxMessage(moved, moved);
+		queueInboxPushes('alice', 'account-alice', '2', []);
+		expect(one('SELECT identity FROM push_silent_arrivals')).toBeNull();
+		const incoming = { ...save(3), uidValidity: '2' };
+		queueInboxPushes('alice', 'account-alice', '2', [incoming]);
+		expect(one('SELECT message_id FROM push_jobs')).not.toBeNull();
+		silenceMovedInboxMessage(message(2), { ...message(2), uidValidity: '2' });
+		queueInboxPushes('alice', 'account-alice', '2', [incoming]);
+		expect(one('SELECT identity FROM push_silent_arrivals')).toBeNull();
+	});
+
 	test('session changes discard old queued mail and logout removes registrations', async () => {
 		const { queueInboxPushes } = await setup();
 		queueInboxPushes('alice', 'account-alice', '1', []);

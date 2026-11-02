@@ -1,4 +1,4 @@
-import { queueInboxPushes } from './push';
+import { queueInboxPushes, silenceMovedInboxMessage } from './push';
 import { providerBimiLogo } from './bimi';
 import { ImapFlow, type FetchMessageObject } from 'imapflow';
 import nodemailer from 'nodemailer';
@@ -812,6 +812,7 @@ export async function updateMessage(
 			);
 			const current: Message = latest ? JSON.parse(latest.data) : mail;
 			if (target && target !== mail.path) {
+				if (change.folder === 'inbox') silenceMovedInboxMessage(mail, moved);
 				db.query('DELETE FROM messages WHERE id=? AND user_id=?').run(id, userId);
 				if (moved) {
 					moved = {
