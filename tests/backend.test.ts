@@ -938,10 +938,13 @@ describe('Message move reconciliation', () => {
 			const body = await response.json();
 			expect(body.pending).toBe(true);
 			expect(body.revision).toBeGreaterThan(revision);
-			expect(body.messages).toEqual([]);
+			expect(body.messages).toHaveLength(1);
+			expect(body.messages[0].folder).toBe('trash');
 			// A refreshed page gets the persisted pending state while the provider is still blocked
 			const refreshed = await (await GET(event('sync'))).json();
-			expect(refreshed.messages).toEqual([]);
+			expect(refreshed.messages.map((message: { folder: string }) => message.folder)).toEqual([
+				'trash'
+			]);
 			expect(one('SELECT message_id FROM pending_moves WHERE user_id=?', 'alice')).not.toBeNull();
 			expect(one('SELECT id FROM messages WHERE id=?', 'moving')).not.toBeNull();
 		} finally {
@@ -977,7 +980,7 @@ describe('Message move reconciliation', () => {
 		const { queueMessageMove, processPendingMoves } = await import('../src/lib/server/mail');
 		try {
 			queueMessageMove('alice', 'moving', { folder: 'trash' });
-			expect(snapshot('alice').messages).toEqual([]);
+			expect(snapshot('alice').messages.map((message) => message.folder)).toEqual(['trash']);
 			expect(one('SELECT message_id FROM pending_moves')).not.toBeNull();
 			await GET(event('sync'));
 			await processPendingMoves('alice');
@@ -1227,7 +1230,7 @@ describe('Permanent deletion from Trash', () => {
 		}
 	});
 
-	test('bulk moves are hidden in one response without waiting for the provider', async () => {
+	test('bulk moves show in their destination in one response without waiting for the provider', async () => {
 		const { processPendingMoves } = await import('../src/lib/server/mail');
 		const state = await fixture();
 		const worker = spyOn(
@@ -1237,7 +1240,9 @@ describe('Permanent deletion from Trash', () => {
 		try {
 			const response = await bulk({ ids: ['trashed', 'other', 'gone'], folder: 'archive' });
 			expect(response.status).toBe(202);
-			expect((await response.json()).messages).toEqual([]);
+			const messages: { folder: string }[] = (await response.json()).messages;
+			expect(messages).toHaveLength(2);
+			expect(messages.every((message) => message.folder === 'archive')).toBe(true);
 		} finally {
 			await processPendingMoves('alice').catch(() => {});
 			worker.mockRestore();

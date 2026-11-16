@@ -54,12 +54,12 @@ export function snapshot(userId: string): Snapshot {
 		accounts: all<{ data: string }>('SELECT data FROM accounts WHERE user_id=?', userId).map((x) =>
 			JSON.parse(x.data)
 		),
-		messages: all<{ data: string }>(
-			'SELECT data FROM messages WHERE user_id=? AND id NOT IN (SELECT message_id FROM pending_moves WHERE user_id=?)',
-			userId,
+		// Queued moves already show in their destination, so clients never wait for the provider
+		messages: all<{ data: string; changes: string | null }>(
+			'SELECT m.data, p.changes FROM messages m LEFT JOIN pending_moves p ON p.message_id=m.id AND p.user_id=m.user_id WHERE m.user_id=?',
 			userId
 		).map((x) => {
-			const message = JSON.parse(x.data);
+			const message = { ...JSON.parse(x.data), ...(x.changes ? JSON.parse(x.changes) : {}) };
 			return { ...message, websiteIconDomains: websiteIconDomains(message.fromAddress || '') };
 		}),
 		drafts: all<{ data: string }>('SELECT data FROM drafts WHERE user_id=?', userId).map((x) =>

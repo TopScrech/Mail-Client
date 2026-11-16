@@ -268,14 +268,16 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 			.map((x) => x.id)
 			.filter((x) => !accountId || x === accountId);
 		const errors: string[] = [];
-		await serialized(uid, async () => {
-			for (const id of ids)
-				try {
-					await syncAccount(uid, id);
-				} catch (e) {
-					errors.push(e instanceof ApiError ? e.message : 'Sync failed');
-				}
-		});
+		// Accounts use separate connections and rows, so they sync side by side instead of one after another
+		await serialized(uid, () =>
+			Promise.all(
+				ids.map((id) =>
+					syncAccount(uid, id).catch((e) => {
+						errors.push(e instanceof ApiError ? e.message : 'Sync failed');
+					})
+				)
+			)
+		);
 		return json({ ...snapshot(uid), errors });
 	}
 	if (path === 'messages' && method === 'PATCH') {
