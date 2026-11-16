@@ -28,6 +28,7 @@
 		{ id: 'sent', label: 'Sent', icon: 'send' },
 		{ id: 'drafts', label: 'Drafts', icon: 'draft' },
 		{ id: 'archive', label: 'Archive', icon: 'archive' },
+		{ id: 'junk', label: 'Junk', icon: 'close' },
 		{ id: 'trash', label: 'Trash', icon: 'trash' }
 	];
 	let draftCount = $derived(

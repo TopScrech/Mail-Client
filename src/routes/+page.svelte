@@ -79,7 +79,7 @@
 			if (mailbox.accounts.some((account) => account.id === saved?.selectedAccount)) {
 				selectedAccount = saved.selectedAccount;
 			}
-			if (['inbox', 'starred', 'sent', 'drafts', 'archive', 'trash'].includes(saved?.folder)) {
+			if (['inbox', 'starred', 'sent', 'drafts', 'archive', 'junk', 'trash'].includes(saved?.folder)) {
 				folder = saved.folder;
 			}
 			query = typeof saved?.query === 'string' ? saved.query : '';

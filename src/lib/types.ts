@@ -1,4 +1,4 @@
-export type Folder = 'inbox' | 'starred' | 'sent' | 'drafts' | 'archive' | 'trash';
+export type Folder = 'inbox' | 'starred' | 'sent' | 'drafts' | 'archive' | 'junk' | 'trash';
 export interface MailAccount {
 	id: string;
 	email: string;

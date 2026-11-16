@@ -248,11 +248,13 @@ export async function connectAccount(
 const special: Record<string, Folder> = {
 	'\\Sent': 'sent',
 	'\\Archive': 'archive',
+	'\\Junk': 'junk',
 	'\\Trash': 'trash'
 };
 const folderSpecial: Partial<Record<Folder, string>> = {
 	sent: '\\Sent',
 	archive: '\\Archive',
+	junk: '\\Junk',
 	trash: '\\Trash'
 };
 async function destination(client: ImapFlow, folder: Folder) {

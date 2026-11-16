@@ -299,7 +299,7 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		if (typeof input.read === 'boolean') change.read = input.read;
 		if (typeof input.starred === 'boolean') change.starred = input.starred;
 		if (input.folder) {
-			assert(['inbox', 'archive', 'trash'].includes(input.folder), 'Invalid destination');
+			assert(['inbox', 'archive', 'junk', 'trash'].includes(input.folder), 'Invalid destination');
 			change.folder = input.folder;
 			queueMessageMove(uid, input.id, { ...change, folder: input.folder });
 			void processPendingMoves(uid).catch(() => {});
@@ -338,7 +338,7 @@ async function dispatch(event: RequestEvent): Promise<Response> {
 		if (typeof input.read === 'boolean') change.read = input.read;
 		if (typeof input.starred === 'boolean') change.starred = input.starred;
 		if (input.folder) {
-			assert(['inbox', 'archive', 'trash'].includes(input.folder), 'Invalid destination');
+			assert(['inbox', 'archive', 'junk', 'trash'].includes(input.folder), 'Invalid destination');
 			queueMessageMoves(uid, ids, { ...change, folder: input.folder });
 			void processPendingMoves(uid).catch(() => {});
 			return json({ ok: true, pending: true, ...snapshot(uid) }, { status: 202 });
