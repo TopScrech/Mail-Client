@@ -641,10 +641,24 @@ export async function syncAccount(userId: string, id: string) {
 		await client.logout().catch(() => {});
 	}
 }
+/** A provider move gives a message a new ID, so requests made with the old one still reach it */
+function currentMessageId(userId: string, id: string) {
+	let current = id;
+	for (let hop = 0; hop < 10; hop++) {
+		const alias = one<{ new_id: string }>(
+			'SELECT new_id FROM moved_messages WHERE old_id=? AND user_id=?',
+			current,
+			userId
+		);
+		if (!alias) break;
+		current = alias.new_id;
+	}
+	return current;
+}
 export function message(userId: string, id: string) {
 	const row = one<{ data: string }>(
 		'SELECT data FROM messages WHERE id=? AND user_id=?',
-		id,
+		currentMessageId(userId, id),
 		userId
 	);
 	assert(row, 'Message not found', 404);
@@ -664,15 +678,35 @@ export function queueMessageMove(
 ) {
 	const mail = message(userId, id);
 	db.transaction(() => {
-		db.query('INSERT INTO pending_moves VALUES (?,?,?,?,?) ON CONFLICT(message_id) DO NOTHING').run(
-			id,
+		queuePendingMove(userId, mail, change);
+		bump(userId);
+	})();
+}
+/** A newer change replaces a queued one, so undoing a move before the provider caught up still restores the message */
+function queuePendingMove(
+	userId: string,
+	mail: Message,
+	change: { read?: boolean; starred?: boolean; folder: Folder }
+) {
+	const pending = one<{ changes: string }>(
+		'SELECT changes FROM pending_moves WHERE message_id=? AND user_id=?',
+		mail.id,
+		userId
+	);
+	if (pending)
+		db.query('UPDATE pending_moves SET changes=? WHERE message_id=? AND user_id=?').run(
+			JSON.stringify({ ...JSON.parse(pending.changes), ...change }),
+			mail.id,
+			userId
+		);
+	else
+		db.query('INSERT INTO pending_moves VALUES (?,?,?,?,?)').run(
+			mail.id,
 			userId,
 			mail.accountId,
 			JSON.stringify(change),
 			JSON.stringify(mail)
 		);
-		bump(userId);
-	})();
 }
 export function processPendingMoves(userId: string): Promise<void> {
 	const running = moveWorkers.get(userId);
@@ -691,7 +725,8 @@ export function processPendingMoves(userId: string): Promise<void> {
 					userId,
 					move.message_id,
 					JSON.parse(move.changes),
-					JSON.parse(move.message)
+					JSON.parse(move.message),
+					move.changes
 				);
 				completed = true;
 			} catch (error) {
@@ -720,9 +755,11 @@ export function processPendingMoves(userId: string): Promise<void> {
 				}
 			} finally {
 				db.transaction(() => {
-					db.query('DELETE FROM pending_moves WHERE message_id=? AND user_id=?').run(
+					// A change queued while this one ran stays, so it runs next against the current message
+					db.query('DELETE FROM pending_moves WHERE message_id=? AND user_id=? AND changes=?').run(
 						move!.message_id,
-						userId
+						userId,
+						move!.changes
 					);
 					if (
 						completed &&
@@ -760,13 +797,62 @@ export function processPendingMoves(userId: string): Promise<void> {
 	moveWorkers.set(userId, worker);
 	return worker;
 }
+function movedMessage(
+	mail: Message,
+	change: { read?: boolean; starred?: boolean; folder?: Folder },
+	target: string,
+	uid: number,
+	uidValidity: string
+): Message {
+	return {
+		...mail,
+		...change,
+		folder: change.folder!,
+		path: target,
+		uid,
+		uidValidity,
+		id: `${mail.accountId}:${encodeURIComponent(target)}:${uidValidity}:${uid}`
+	};
+}
+/** Finds the moved copy by its Message-ID when the provider does not report its new UID */
+async function locateMovedMessage(
+	client: ImapFlow,
+	mail: Message,
+	change: { read?: boolean; starred?: boolean; folder?: Folder },
+	target: string
+) {
+	if (!mail.messageId) return undefined;
+	try {
+		const lock = await client.getMailboxLock(target, { readOnly: true });
+		try {
+			const uids = await client.search({ header: { 'message-id': mail.messageId } }, { uid: true });
+			if (!uids || !uids.length || !client.mailbox) return undefined;
+			return movedMessage(
+				mail,
+				change,
+				target,
+				Math.max(...uids),
+				client.mailbox.uidValidity.toString()
+			);
+		} finally {
+			lock.release();
+		}
+	} catch {
+		return undefined;
+	}
+}
+/**
+ * @param pending The queued change being applied, so a change queued meanwhile follows the message to its new ID
+ */
 export async function updateMessage(
 	userId: string,
-	id: string,
+	requestedId: string,
 	change: { read?: boolean; starred?: boolean; folder?: Folder },
-	original?: Message
+	original?: Message,
+	pending?: string
 ) {
-	const mail = original || message(userId, id);
+	const mail = original || message(userId, requestedId);
+	const id = mail.id;
 	const { data, credentials } = await authorizedAccount(userId, mail.accountId);
 	const client = imap(data, credentials);
 	try {
@@ -790,22 +876,14 @@ export async function updateMessage(
 				const result = await client.messageMove(mail.uid, target, { uid: true });
 				assert(result, 'Message could not be moved — sync and try again', 409);
 				const uid = result.uidMap?.get(mail.uid);
-				if (uid && result.uidValidity) {
-					const uidValidity = result.uidValidity.toString();
-					moved = {
-						...mail,
-						...change,
-						folder: change.folder!,
-						path: target,
-						uid,
-						uidValidity,
-						id: `${mail.accountId}:${encodeURIComponent(target)}:${uidValidity}:${uid}`
-					};
-				}
+				if (uid && result.uidValidity)
+					moved = movedMessage(mail, change, target, uid, result.uidValidity.toString());
 			}
 		} finally {
 			lock.release();
 		}
+		if (target && target !== mail.path && !moved)
+			moved = await locateMovedMessage(client, mail, change, target);
 		db.transaction(() => {
 			const latest = one<{ data: string }>(
 				'SELECT data FROM messages WHERE id=? AND user_id=?',
@@ -830,6 +908,24 @@ export async function updateMessage(
 						db.query(
 							'INSERT OR IGNORE INTO body_jobs (message_id,user_id,account_id,size) VALUES (?,?,?,0)'
 						).run(moved.id, userId, moved.accountId);
+					db.query('DELETE FROM moved_messages WHERE user_id=? AND moved_at<?').run(
+						userId,
+						Date.now() - 86_400_000
+					);
+					db.query(
+						'INSERT INTO moved_messages VALUES (?,?,?,?) ON CONFLICT(old_id) DO UPDATE SET new_id=excluded.new_id, moved_at=excluded.moved_at'
+					).run(id, userId, moved.id, Date.now());
+				}
+				if (pending !== undefined) {
+					// A change queued while the provider moved the message, like an undo, follows it to its new ID
+					if (moved)
+						db.query(
+							'UPDATE pending_moves SET message_id=?, message=? WHERE message_id=? AND user_id=? AND changes!=?'
+						).run(moved.id, JSON.stringify(moved), id, userId, pending);
+					else
+						db.query(
+							'DELETE FROM pending_moves WHERE message_id=? AND user_id=? AND changes!=?'
+						).run(id, userId, pending);
 				}
 			} else
 				db.query('UPDATE messages SET data=? WHERE id=? AND user_id=?').run(
@@ -843,8 +939,9 @@ export async function updateMessage(
 		await client.logout().catch(() => {});
 	}
 }
-export async function permanentlyDeleteMessage(userId: string, id: string) {
-	const mail = message(userId, id);
+export async function permanentlyDeleteMessage(userId: string, requestedId: string) {
+	const mail = message(userId, requestedId);
+	const id = mail.id;
 	assert(mail.folder === 'trash', 'Only messages in Trash can be permanently deleted', 409);
 	assert(
 		!one('SELECT message_id FROM pending_moves WHERE message_id=? AND user_id=?', id, userId),
@@ -919,7 +1016,7 @@ function cachedMessages(userId: string, ids: string[]) {
 	return ids.flatMap((id) => {
 		const row = one<{ data: string }>(
 			'SELECT data FROM messages WHERE id=? AND user_id=?',
-			id,
+			currentMessageId(userId, id),
 			userId
 		);
 		return row ? [JSON.parse(row.data) as Message] : [];
@@ -972,10 +1069,7 @@ export function queueMessageMoves(
 	change: { read?: boolean; starred?: boolean; folder: Folder }
 ) {
 	db.transaction(() => {
-		for (const mail of cachedMessages(userId, ids))
-			db.query(
-				'INSERT INTO pending_moves VALUES (?,?,?,?,?) ON CONFLICT(message_id) DO NOTHING'
-			).run(mail.id, userId, mail.accountId, JSON.stringify(change), JSON.stringify(mail));
+		for (const mail of cachedMessages(userId, ids)) queuePendingMove(userId, mail, change);
 		bump(userId);
 	})();
 }

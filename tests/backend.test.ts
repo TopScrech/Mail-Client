@@ -866,7 +866,11 @@ describe('Mail account reconnection', () => {
 });
 
 describe('Message move reconciliation', () => {
-	async function mockMove(failure = false, mapsUID = true) {
+	async function mockMove(
+		failure = false,
+		mapsUID = true,
+		move?: (uid: number, target: string) => Promise<unknown>
+	) {
 		const { ImapFlow } = await import('imapflow');
 		const data = {
 			...snapshot('alice').accounts[0],
@@ -907,7 +911,8 @@ describe('Message move reconciliation', () => {
 				this.mailbox = { uidValidity: 1n } as never;
 				return { release() {} } as never;
 			}),
-			spyOn(ImapFlow.prototype, 'messageMove').mockImplementation(async () => {
+			spyOn(ImapFlow.prototype, 'messageMove').mockImplementation(async (uid, target) => {
+				if (move) return (await move(Number(uid), String(target))) as never;
 				if (failure) throw new Error('Provider unavailable');
 				return {
 					path: 'INBOX',
@@ -1026,6 +1031,95 @@ describe('Message move reconciliation', () => {
 		});
 	}
 
+	// Every move gets a new UID, like a provider that reports UIDPLUS mappings
+	const remap = async (uid: number) => ({ uidValidity: 1n, uidMap: new Map([[uid, uid + 100]]) });
+	const folders = () => snapshot('alice').messages.map((message) => message.folder);
+
+	test('undoing a move before the provider ran cancels it without touching the provider', async () => {
+		const moves: string[] = [];
+		const restore = await mockMove(false, true, async (uid, target) => {
+			moves.push(target);
+			return remap(uid);
+		});
+		const { serialized, processPendingMoves } = await import('../src/lib/server/mail');
+		let release!: () => void;
+		const slowSync = serialized('alice', () => new Promise<void>((resolve) => (release = resolve)));
+		try {
+			await PATCH(event('messages/bulk', 'PATCH', { ids: ['moving'], folder: 'trash' }));
+			const undo = await PATCH(
+				event('messages/bulk', 'PATCH', { ids: ['moving'], folder: 'inbox' })
+			);
+			expect((await undo.json()).messages[0].folder).toBe('inbox');
+			release();
+			await slowSync;
+			await processPendingMoves('alice');
+		} finally {
+			restore();
+		}
+		expect(moves).toEqual([]);
+		expect(folders()).toEqual(['inbox']);
+		expect(snapshot('alice').messages[0].id).toBe('moving');
+		expect(one('SELECT message_id FROM pending_moves')).toBeNull();
+	});
+	test('undoing a move while the provider runs it moves the message back afterwards', async () => {
+		const moves: string[] = [];
+		let undo!: Promise<Response>;
+		const restore = await mockMove(false, true, async (uid, target) => {
+			moves.push(target);
+			if (moves.length === 1)
+				undo = PATCH(event('messages/bulk', 'PATCH', { ids: ['moving'], folder: 'inbox' }));
+			return remap(uid);
+		});
+		const { processPendingMoves } = await import('../src/lib/server/mail');
+		try {
+			await PATCH(event('messages/bulk', 'PATCH', { ids: ['moving'], folder: 'trash' }));
+			await processPendingMoves('alice');
+			await undo;
+			await processPendingMoves('alice');
+		} finally {
+			restore();
+		}
+		expect(moves).toEqual(['Trash', 'INBOX']);
+		expect(folders()).toEqual(['inbox']);
+		expect(snapshot('alice').messages[0].id).toBe('account-alice:INBOX:1:207');
+		expect(one('SELECT message_id FROM pending_moves')).toBeNull();
+	});
+	test('undoing a finished move with the old ID still reaches the moved message', async () => {
+		const restore = await mockMove(false, true, async (uid) => remap(uid));
+		const { processPendingMoves } = await import('../src/lib/server/mail');
+		try {
+			await PATCH(event('messages/bulk', 'PATCH', { ids: ['moving'], folder: 'trash' }));
+			await processPendingMoves('alice');
+			expect(snapshot('alice').messages[0].id).toBe('account-alice:Trash:1:107');
+			const undo = await PATCH(
+				event('messages/bulk', 'PATCH', { ids: ['moving'], folder: 'inbox' })
+			);
+			expect((await undo.json()).messages[0].folder).toBe('inbox');
+			await processPendingMoves('alice');
+		} finally {
+			restore();
+		}
+		expect(folders()).toEqual(['inbox']);
+		expect(snapshot('alice').messages[0].id).toBe('account-alice:INBOX:1:207');
+	});
+	test('a move without a reported UID finds the moved copy by its Message-ID', async () => {
+		const { ImapFlow } = await import('imapflow');
+		const restore = await mockMove(false, false);
+		db.query(
+			"UPDATE messages SET data=json_set(data,'$.messageId','<otter@example.com>') WHERE id=?"
+		).run('moving');
+		const search = spyOn(ImapFlow.prototype, 'search').mockResolvedValue([40, 42] as never);
+		const { updateMessage } = await import('../src/lib/server/mail');
+		try {
+			await updateMessage('alice', 'moving', { folder: 'trash' });
+			expect(search.mock.calls[0][0]).toEqual({ header: { 'message-id': '<otter@example.com>' } });
+		} finally {
+			search.mockRestore();
+			restore();
+		}
+		expect(snapshot('alice').messages[0].id).toBe('account-alice:Trash:1:42');
+		expect(folders()).toEqual(['trash']);
+	});
 	test('users cannot queue moves for another user’s messages', async () => {
 		const restore = await mockMove();
 		try {
