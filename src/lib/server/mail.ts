@@ -1195,13 +1195,14 @@ export async function attachment(userId: string, id: string, index: number) {
 				409
 			);
 			const metadata = await client.fetchOne(mail.uid, { size: true }, { uid: true });
+			assert(metadata, 'Message not found', 404);
 			assert(
-				metadata && metadata.size && metadata.size <= 20 * 1024 * 1024,
+				metadata.size && metadata.size <= 20 * 1024 * 1024,
 				'Attachment exceeds the 20 MB download limit',
 				413
 			);
 			const source = await client.fetchOne(mail.uid, { source: true }, { uid: true });
-			assert(source && source.source, 'Message no longer exists', 404);
+			assert(source && source.source, 'Message not found', 404);
 			const parsed = await simpleParser(source.source);
 			const file = parsed.attachments[index];
 			assert(file, 'Attachment not found', 404);
