@@ -13,6 +13,7 @@ import { db, one, all, challenge, consume, type User } from './db';
 import { origin, rpID, secure, assert, appleConfigured, ApiError } from './config';
 import { opaque, hash } from './crypto';
 const duration = 30 * 86400;
+const renewInterval = 86400;
 export interface Session {
 	id: string;
 	user_id: string;
@@ -31,14 +32,31 @@ interface Passkey {
 }
 export function session(event: RequestEvent) {
 	const bearer = event.request.headers.get('authorization');
-	const token = bearer?.startsWith('Bearer ') ? bearer.slice(7) : event.cookies.get('session');
-	return token
-		? one<Session>(
-				'SELECT * FROM sessions WHERE token_hash=? AND expires>?',
-				hash(token),
-				Date.now()
-			)
-		: null;
+	const fromBearer = bearer?.startsWith('Bearer ');
+	const token = fromBearer ? bearer!.slice(7) : event.cookies.get('session');
+	if (!token) return null;
+	const now = Date.now();
+	const current = one<Session>(
+		'SELECT * FROM sessions WHERE token_hash=? AND expires>?',
+		hash(token),
+		now
+	);
+	// Sessions in active use slide forward, at most once a day, so only idle devices sign out
+	if (current && current.expires - now < (duration - renewInterval) * 1000) {
+		current.expires = now + duration * 1000;
+		db.query('UPDATE sessions SET expires=? WHERE id=?').run(current.expires, current.id);
+		if (!fromBearer) setSessionCookie(event, token);
+	}
+	return current;
+}
+function setSessionCookie(event: RequestEvent, token: string) {
+	event.cookies.set('session', token, {
+		path: '/',
+		httpOnly: true,
+		secure,
+		sameSite: 'lax',
+		maxAge: duration
+	});
 }
 export function requireSession(event: RequestEvent) {
 	const current = session(event);
@@ -55,13 +73,7 @@ function newSession(event: RequestEvent, userId: string, native = false) {
 		new Date().toISOString(),
 		Date.now() + duration * 1000
 	);
-	event.cookies.set('session', token, {
-		path: '/',
-		httpOnly: true,
-		secure,
-		sameSite: 'lax',
-		maxAge: duration
-	});
+	setSessionCookie(event, token);
 	return { ok: true, ...(native ? { token, expiresIn: duration } : {}) };
 }
 export function profile(event: RequestEvent) {

@@ -109,6 +109,18 @@ describe('Authentication boundaries', () => {
 		limit('key', 2);
 		expect(() => limit('key', 2)).toThrow();
 	});
+	test('active sessions renew at most once a day and expired ones stay expired', async () => {
+		const expires = () =>
+			one<{ expires: number }>('SELECT expires FROM sessions WHERE id=?', 'session-alice')!.expires;
+		expect((await GET(event('me'))).status).toBe(200);
+		const renewed = expires();
+		expect(renewed).toBeGreaterThan(Date.now() + 29 * 86400_000);
+		expect((await GET(event('me'))).status).toBe(200);
+		expect(expires()).toBe(renewed);
+		db.query('UPDATE sessions SET expires=0 WHERE id=?').run('session-alice');
+		expect((await GET(event('me'))).status).toBe(401);
+		expect(expires()).toBe(0);
+	});
 	test('logout revokes server session', async () => {
 		expect((await POST(event('auth/logout', 'POST', {}))).status).toBe(200);
 		expect((await GET(event('me'))).status).toBe(401);
